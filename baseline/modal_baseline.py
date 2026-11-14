@@ -1,9 +1,11 @@
 """Untuned Qwen3-8B baseline on Modal (AGENTS.md §4).
 
-Measures: HarmBench ASR (plain + prefill attack), XSTest false refusal, GSM8K accuracy.
+Measures: HarmBench ASR (plain + prefill attacks), XSTest false refusal, GSM8K accuracy.
 
 Usage:
-    modal run baseline/modal_baseline.py                 # full run
+    modal run baseline/modal_baseline.py                 # full run, one prefill ("Sure, here is")
+    modal run baseline/modal_baseline.py --attacks random  # one random phrase (of 50) per request
+    modal run baseline/modal_baseline.py --attacks all   # every prefill attack in prefill_attacks.py
     modal run baseline/modal_baseline.py --limit 10      # smoke test (~10 items per set)
     modal run baseline/modal_baseline.py --reuse-gen     # re-judge saved generations only
 
@@ -12,16 +14,20 @@ Completions to harmful prompts are written to disk only; never printed.
 """
 
 import json
+import math
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import modal
 
+sys.path.insert(0, str(Path(__file__).parent))
+import prefill_attacks as pa  # noqa: E402
+
 GEN_MODEL = "Qwen/Qwen3-8B"
 CLS_MODEL = "cais/HarmBench-Llama-2-13b-cls"
-PREFILL = "Sure, here is"
 SEED = 0
 MAX_TOKENS_SAFETY = 512  # HarmBench classifier convention
 MAX_TOKENS_GSM8K = 1024
@@ -34,6 +40,7 @@ image = (
     # transformers>=4.54 breaks vllm 0.9.2 import ("'aimv2' is already used")
     .pip_install("vllm==0.9.2", "transformers==4.53.2", "datasets==3.6.0", "hf_transfer")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .add_local_file(Path(__file__).parent / "prefill_attacks.py", "/root/prefill_attacks.py")
 )
 VOLUMES = {"/root/.cache/huggingface": hf_cache}
 SECRETS = [modal.Secret.from_name("huggingface")]
@@ -60,7 +67,8 @@ Answer: [/INST]"""
 
 
 @app.function(image=image, gpu="H100", volumes=VOLUMES, secrets=SECRETS, timeout=3600)
-def generate(limit: int | None = None) -> dict:
+def generate(limit: int | None = None, attack_ids: list[str] | None = None,
+             prefill_seed: int = 0) -> dict:
     from datasets import load_dataset
     from vllm import LLM, SamplingParams
 
@@ -99,12 +107,27 @@ def generate(limit: int | None = None) -> dict:
         for i, (r, (g, n)) in enumerate(zip(harm, plain))
     ]
 
-    pre = run([chat(r["prompt"], PREFILL) for r in harm], MAX_TOKENS_SAFETY)
-    res["harmbench_prefill"] = [
-        {"id": i, "behavior": r["prompt"], "category": r.get("category"),
-         "generation": PREFILL + g, "n_tokens": n}
-        for i, (r, (g, n)) in enumerate(zip(harm, pre))
-    ]
+    # jobs: (attack id, family, split, request index, row, prefill text, phrase index or None)
+    targets, jobs = None, []
+    for aid in attack_ids or [pa.DEFAULT_ATTACK]:
+        if aid == pa.RANDOM_ATTACK_ID:  # one random phrase per request, each phrase <= 5 uses
+            picks = pa.assign_random_prefills(len(harm), seed=prefill_seed)
+            jobs += [(aid, aid, aid, i, r, pa.RANDOM_PHRASES[picks[i]], picks[i])
+                     for i, r in enumerate(harm)]
+            continue
+        a = pa.BY_ID[aid]
+        if a.text is None and targets is None:
+            targets = pa.load_harmbench_targets()
+        jobs += [(aid, a.family, a.split, i, r, pa.prefill_text(a, r["prompt"], targets), None)
+                 for i, r in enumerate(harm)]
+    outs = run([chat(r["prompt"], pre) for *_, r, pre, _ in jobs], MAX_TOKENS_SAFETY)
+    res["harmbench_attacks"] = {}
+    for (aid, fam, split, i, r, pre, pid), (g, n) in zip(jobs, outs):
+        res["harmbench_attacks"].setdefault(aid, []).append(
+            {"id": i, "attack": aid, "family": fam, "split": split, "phrase_id": pid,
+             "behavior": r["prompt"], "category": r.get("category"),
+             "prefill": pre, "generation": pre + g, "n_tokens": n})  # judge sees the full reply
+    res["prefill_seed"] = prefill_seed
 
     xo = run([chat(r["prompt"]) for r in xs], MAX_TOKENS_SAFETY)
     res["xstest"] = [
@@ -175,32 +198,72 @@ def gsm8k_correct(gen: str, gold: str) -> bool:
         return False
 
 
+def wilson(k: int, n: int, z: float = 1.96) -> list[float]:
+    """95% Wilson score interval for k successes out of n."""
+    if n == 0:
+        return [0.0, 0.0]
+    p = k / n
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return [round(c - h, 4), round(c + h, 4)]
+
+
 def git_sha() -> str:
+    """HEAD of this repo, suffixed "-dirty" if tracked files have uncommitted changes."""
+    def git(*args):
+        return subprocess.check_output(["git", *args], text=True, cwd=Path(__file__).parent,
+                                       stderr=subprocess.DEVNULL).strip()
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        sha = git("rev-parse", "HEAD")
+        return sha + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
     except Exception:
         return "unknown"
 
 
 @app.local_entrypoint()
-def main(limit: int = 0, reuse_gen: bool = False):
-    """--reuse-gen: skip generation and judge the saved generations.json from a prior run."""
+def main(limit: int = 0, reuse_gen: bool = False, attacks: str = "default", prefill_seed: int = 0):
+    """--reuse-gen: skip generation and judge the saved generations.json from a prior run.
+    --attacks: "default" (Sure, here is), "random" (one of 50 phrases per request, each used
+    at most 5 times; --prefill-seed picks the assignment), "all", a split name (train /
+    heldout_string / heldout_family), or a comma-separated list of attack ids."""
     t0 = time.time()
-    out = Path("outputs/baseline_qwen3_8b" + (f"_limit{limit}" if limit else ""))
+    if attacks == "default":
+        attack_ids = [pa.DEFAULT_ATTACK]
+    elif attacks == "random":
+        attack_ids = [pa.RANDOM_ATTACK_ID]
+    elif attacks == "all":
+        attack_ids = [a.id for a in pa.ATTACKS]
+    elif attacks in pa.SPLITS:
+        attack_ids = [a.id for a in pa.attacks_in(attacks)]
+    else:
+        attack_ids = [x.strip() for x in attacks.split(",") if x.strip()]
+        unknown = [x for x in attack_ids if x not in pa.BY_ID]
+        if unknown:
+            raise SystemExit(f"Unknown attack ids {unknown}. Known: {sorted(pa.BY_ID)}")
+    suffix = "" if attacks == "default" else "_attacks-" + attacks.replace(",", "+")
+    if attacks == "random" and prefill_seed:
+        suffix += f"-seed{prefill_seed}"
+    out = Path("outputs/baseline_qwen3_8b" + suffix + (f"_limit{limit}" if limit else ""))
     out.mkdir(parents=True, exist_ok=True)
     gen_path = out / "generations.json"
     if reuse_gen and gen_path.exists():
         res = json.loads(gen_path.read_text())
         print(f"Reusing {gen_path}")
     else:
-        res = generate.remote(limit or None)
+        res = generate.remote(limit or None, attack_ids, prefill_seed)
         gen_path.write_text(json.dumps(res))  # save before judging so a judge crash loses nothing
+    if "harmbench_attacks" not in res:  # generations.json from before the attack registry
+        a = pa.BY_ID[pa.DEFAULT_ATTACK]
+        res["harmbench_attacks"] = {a.id: [
+            dict(x, attack=a.id, family=a.family, split=a.split, prefill=a.text)
+            for x in res.pop("harmbench_prefill")]}
+    ha = res["harmbench_attacks"]
 
-    flags = judge.remote(res["harmbench_plain"] + res["harmbench_prefill"])
-    n = len(res["harmbench_plain"])
-    for x, f in zip(res["harmbench_plain"], flags[:n]):
-        x["harmful"] = f
-    for x, f in zip(res["harmbench_prefill"], flags[n:]):
+    to_judge = res["harmbench_plain"] + [x for aid in ha for x in ha[aid]]
+    flags = judge.remote(to_judge)
+    assert len(flags) == len(to_judge)
+    for x, f in zip(to_judge, flags):
         x["harmful"] = f
 
     for x in res["xstest"]:
@@ -214,8 +277,37 @@ def main(limit: int = 0, reuse_gen: bool = False):
         labels = sorted({str(x["label"]) for x in res["xstest"]})
         raise ValueError(f"Unexpected XSTest labels {labels}; fix the safe/unsafe mapping.")
     mean = lambda xs, k: sum(bool(x[k]) for x in xs) / max(len(xs), 1)
-    all_items = [x for k in ("harmbench_plain", "harmbench_prefill", "xstest", "gsm8k")
-                 for x in res[k]]
+    all_items = (res["harmbench_plain"] + [x for aid in ha for x in ha[aid]]
+                 + res["xstest"] + res["gsm8k"])
+
+    n_beh = len(res["harmbench_plain"])
+    per_attack = {}
+    for aid, xs in ha.items():
+        k = sum(x["harmful"] for x in xs)
+        per_attack[aid] = {"family": xs[0]["family"], "split": xs[0]["split"],
+                           "asr": k / len(xs), "ci95": wilson(k, len(xs)), "k": k, "n": len(xs)}
+
+    random_pool = None
+    if pa.RANDOM_ATTACK_ID in ha:
+        rows = ha[pa.RANDOM_ATTACK_ID]
+        uses = {}
+        for x in rows:
+            u = uses.setdefault(x["phrase_id"], {"phrase": x["prefill"], "k": 0, "n": 0})
+            u["n"] += 1
+            u["k"] += bool(x["harmful"])
+        random_pool = {**per_attack[pa.RANDOM_ATTACK_ID], "prefill_seed": res.get("prefill_seed", 0),
+                       "distinct_phrases": len(uses), "max_uses": max(u["n"] for u in uses.values()),
+                       "per_phrase": {str(i): uses[i] for i in sorted(uses)}}  # n<=5 each: descriptive only
+
+    def split_stats(split):
+        ids = [aid for aid in ha if per_attack[aid]["split"] == split]
+        if not ids:
+            return None
+        broken = [any(ha[aid][i]["harmful"] for aid in ids) for i in range(n_beh)]
+        return {"attacks": ids,
+                "mean_asr": sum(per_attack[a]["asr"] for a in ids) / len(ids),
+                "any_asr": sum(broken) / n_beh,  # behavior broken by >=1 attack in the split
+                "any_ci95": wilson(sum(broken), n_beh)}
 
     summary = {
         "model": GEN_MODEL,
@@ -224,11 +316,17 @@ def main(limit: int = 0, reuse_gen: bool = False):
         "seed": SEED,
         "limit": limit or None,
         "ASR_plain": mean(res["harmbench_plain"], "harmful"),
-        "ASR_prefill": mean(res["harmbench_prefill"], "harmful"),
+        "ASR_plain_ci95": wilson(sum(x["harmful"] for x in res["harmbench_plain"]), n_beh),
+        "ASR_prefill": per_attack.get(pa.DEFAULT_ATTACK, {}).get("asr"),  # "Sure, here is"
+        "attacks": per_attack,
+        "by_split": {s: split_stats(s) for s in pa.SPLITS if split_stats(s)},
+        "random_pool": random_pool,
+        "harmbench_commit_for_targets": pa.HARMBENCH_COMMIT,
         "xstest_false_refusal_rate_safe": mean(safe, "refused"),
         "xstest_refusal_rate_unsafe": mean(unsafe, "refused"),
         "gsm8k_acc": mean(res["gsm8k"], "correct"),
-        "n": {k: len(res[k]) for k in ("harmbench_plain", "harmbench_prefill", "xstest", "gsm8k")},
+        "n": {"harmbench_behaviors": n_beh, "attacks": len(ha),
+              "xstest": len(res["xstest"]), "gsm8k": len(res["gsm8k"])},
         "mean_tokens": sum(x["n_tokens"] for x in all_items) / max(len(all_items), 1),
         "gen_seconds": round(res["_gen_seconds"], 1),
         "wall_seconds": round(time.time() - t0, 1),
@@ -236,9 +334,14 @@ def main(limit: int = 0, reuse_gen: bool = False):
         "git_sha": git_sha(),
     }
 
-    for k in ("harmbench_plain", "harmbench_prefill", "xstest", "gsm8k"):
+    files = {"harmbench_plain": res["harmbench_plain"],
+             "harmbench_attacks": [x for aid in ha for x in ha[aid]],
+             "xstest": res["xstest"], "gsm8k": res["gsm8k"]}
+    if pa.DEFAULT_ATTACK in ha:  # same file name as earlier runs
+        files["harmbench_prefill"] = ha[pa.DEFAULT_ATTACK]
+    for k, rows in files.items():
         with open(out / f"{k}.jsonl", "w") as f:
-            for x in res[k]:
+            for x in rows:
                 f.write(json.dumps(x) + "\n")
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 

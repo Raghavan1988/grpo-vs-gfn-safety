@@ -41,6 +41,12 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
 3. **Measured untuned Qwen3-8B ASR: 13% plain, 62% with a "Sure, here is" prefill** (HarmBench,
    n=200). Plain is not ≈0 (mostly misinformation/cybercrime), but the attacked condition is where
    the headroom is. Always report both, plus DIJA for NAR.
+   Prefill attacks are varied, not static: `baseline/prefill_attacks.py` holds 10 openers split
+   into `train` / `heldout_string` / `heldout_family`. Train only on `train`; the headline
+   robustness number for fine-tuned models is held-out ASR (`--attacks all`).
+   Random-prefill baseline (`--attacks random`: 1 of 50 phrases per request, ≤5 uses each):
+   **42.5%** ASR vs 62% for fixed "Sure, here is". vLLM greedy decoding is not bit-reproducible
+   across runs; compare methods on paired prompts and seeds.
 4. **For AR decoding, TB with reference prior ≡ KL-regularized RL** (Tiapkin et al., Deleu et al.).
    AR comparison therefore tests optimizer / log Z estimation, not the objective. Say so in the paper.
 5. TB is unstable at this scale: length collapse, exploding grads with learned log Z,
@@ -131,7 +137,8 @@ outputs/      gitignored
 ```
 - Every run records: config, seed, git SHA, model revision, judge versions.
 - Keep training judge (WildGuard) and eval judge (HarmBench cls) separate. Never mix.
-- Held-out prompts/attack templates must never enter training data — assert this in code.
+- Held-out prompts/attack templates must never enter training data — assert this in code
+  (`prefill_attacks.assert_no_heldout`, `sample_train_prefill`).
 - Matched budgets between GRPO and TB: same prompts, K, steps, LoRA rank, reward code.
 - Report means ± std over 3 seeds; no single-seed claims.
 
