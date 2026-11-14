@@ -75,6 +75,8 @@ def run_tests() -> str:
               timeout=8 * 3600)
 def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dict,
           init_adapter: str | None = None, data_sha: str = "") -> list[dict]:
+    # vLLM handles fast rollout generation; Transformers/PEFT handles gradients.
+    # The adapter is copied between them before every sampling call.
     import torch
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -103,9 +105,20 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
     base.config.use_cache = False
     base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     base.enable_input_require_grads()
+    ref_ctx = None
     if init_adapter:
-        model = PeftModel.from_pretrained(base, f"/ckpts/{init_adapter}/final", is_trainable=True)
+        path = f"/ckpts/{init_adapter}/final"
+        model = PeftModel.from_pretrained(base, path, adapter_name="default", is_trainable=True)
+        if mode == "grpo" and cfg.get("ref", "base") == "init":
+            # frozen copy of the starting adapter as the KL reference
+            model.load_adapter(path, adapter_name="ref", is_trainable=False)
+            model.set_adapter("default")
+            for n, p in model.named_parameters():
+                p.requires_grad_(".default." in n and "lora_" in n)
+            ref_ctx = rl.adapter_ref_ctx(model)
     else:
+        if mode == "grpo" and cfg.get("ref", "base") == "init":
+            raise SystemExit("ref='init' needs --init adapter")
         model = get_peft_model(base, LoraConfig(task_type="CAUSAL_LM", **LORA))
     model.print_trainable_parameters()
 
@@ -118,12 +131,14 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
         old = tmp / f"a{state['id']}"
         state["id"] += 1
         d = tmp / f"a{state['id']}"
-        model.save_pretrained(d)
+        model.save_pretrained(d, selected_adapters=["default"])
         if old.exists():
             shutil.rmtree(old, ignore_errors=True)
         return LoRARequest(f"a{state['id']}", state["id"], str(d))
 
     def generate_fn(prompt_ids, n, step, temperature, max_new_tokens):
+        # Export the newest adapter so vLLM samples from the current policy rather
+        # than from the weights used at the previous optimizer step.
         req = current_lora()
         greedy = temperature == 0.0
         sp = SamplingParams(n=n, temperature=temperature, top_p=1.0, top_k=-1,
@@ -146,13 +161,15 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
     judge = WildGuardJudge()
 
     def judge_fn(pairs):
+        # Chunk calls so the remote judge receives bounded requests while result
+        # order remains identical to the input order.
         out = []
         for i in range(0, len(pairs), 1024):
             out += judge.score.remote([list(p) for p in pairs[i:i + 1024]])
         return out
 
     def save(tag):
-        model.save_pretrained(run_dir / tag)
+        model.save_pretrained(run_dir / tag, selected_adapters=["default"])
         ckpts.commit()
 
     meta = {"run_name": run_name, "mode": mode, "model": GEN_MODEL, "lora": LORA, "cfg": cfg,
@@ -164,7 +181,7 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
     if mode == "grpo":
         gcfg = rl.GRPOConfig(**cfg)
         logs = rl.train_grpo(model, tok, train_items, val_items, gcfg, generate_fn, judge_fn,
-                             log_fn=log, save_fn=lambda step: save(f"step{step}"))
+                             log_fn=log, save_fn=lambda step: save(f"step{step}"), ref_ctx=ref_ctx)
     elif mode == "sft":
         scfg = rl.SFTConfig(**cfg)
         keep, stats = rl.build_sft_set(tok, train_items, scfg, generate_fn, judge_fn, log_fn=log)
@@ -185,6 +202,7 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
 
 
 def _load_splits():
+    # Refuse to train on a different local dataset than the one recorded in git.
     d = ROOT / "outputs" / "data"
     if not (d / "train.jsonl").exists():
         raise SystemExit("outputs/data/train.jsonl missing: run `python data/build_splits.py` first")
@@ -206,17 +224,24 @@ def _save_local(run_name, logs):
 
 @app.local_entrypoint()
 def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int = 0,
-         sft_epochs: int = 1, tests_only: bool = False):
-    """--pipeline grpo | sft | sft+grpo. Run names default to <pipeline>-s<seed>-<timestamp>."""
+         sft_epochs: int = 1, tests_only: bool = False, ref: str = ""):
+    """--pipeline grpo | sft | sft+grpo. Run names default to <pipeline>-s<seed>-<timestamp>.
+    --ref base | init: KL reference for GRPO. Default: base for pure GRPO, init (the SFT adapter)
+    for sft+grpo, so its GRPO phase is measured against SFT rather than the untuned model."""
     if tests_only:
         print(run_tests.remote())
         return
     tr, va, sha = _load_splits()
     stamp = time.strftime("%m%d-%H%M")
     base = run_name or f"{pipeline.replace('+', '-')}-s{seed}-{stamp}"
-    gcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed))
+    ref = ref or ("init" if pipeline == "sft+grpo" else "base")
+    if ref not in ("base", "init"):
+        raise SystemExit("--ref must be base or init")
+    gcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref))
     scfg = asdict(rl.SFTConfig(epochs=sft_epochs, seed=seed))
     if pipeline == "grpo":
+        if ref == "init":
+            raise SystemExit("pure GRPO has no starting adapter; use --ref base")
         _save_local(base, train.remote(base, "grpo", tr, va, gcfg, None, sha))
     elif pipeline == "sft":
         _save_local(base, train.remote(base, "sft", tr, va, scfg, None, sha))

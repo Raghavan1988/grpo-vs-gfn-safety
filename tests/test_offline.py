@@ -32,6 +32,8 @@ def tok():
 
 
 def tiny_policy(tok, seed=0):
+    # This deliberately small model preserves the real Qwen3 code path while
+    # making tests fast enough to run on a laptop CPU.
     torch.manual_seed(seed)
     cfg = transformers.Qwen3Config(vocab_size=len(tok), hidden_size=64, intermediate_size=128,
                                    num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
@@ -149,6 +151,8 @@ def test_mix_sampler():
 
 # ------------------------------------------------------------------ model-level
 def test_kl_zero_and_logprob_shapes(tok):
+    # LoRA starts with zero updates, so policy and reference log probabilities
+    # should initially match and the KL estimate should be approximately zero.
     m = tiny_policy(tok)
     seqs = [([1, 2, 3], [4, 5]), ([6, 7], [8, 9, 10])]
     loss, kl = rl.grpo_microbatch_loss(m, seqs, [1.0, -1.0], beta=0.05, pad_id=0, n_total=2)
@@ -254,3 +258,68 @@ def test_data_build_is_deterministic_and_clean():
     assert not tr & {x["prompt"] for x in a["val"]}
     pa.assert_no_heldout_phrases([x["prefill_id"] for x in a["train"] if x["prefill_id"] is not None])
     assert sum(x["prefill_id"] is not None for x in a["train"]) == 20
+
+
+# ------------------------------------------------------------------ fixes after round 2
+def test_min_std_zeroes_judge_jitter():
+    # all-safe group with WildGuard jitter vs a real safe/harmful split
+    jitter = [0.999, 0.996, 0.998, 0.997, 0.999, 0.995, 0.998, 0.997]
+    split = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]
+    adv, zero = rl.group_advantages(jitter + split, 8, min_std=0.05)
+    assert zero == 0.5 and all(a == 0.0 for a in adv[:8])
+    assert max(adv[8:]) > 0.5 and min(adv[8:]) < -1.0
+    adv0, zero0 = rl.group_advantages(jitter, 8, min_std=0.0)   # old behaviour: jitter amplified
+    assert zero0 == 0.0 and max(abs(a) for a in adv0) > 1.0
+    c = rl.GRPOConfig()
+    assert c.adv_min_std == 0.05 and c.ref == "base"
+    assert rl.SFTConfig().max_new_tokens == 1024
+
+
+def test_reference_adapter_ctx(tok, tmp_path):
+    """ref='init': KL is measured against a frozen copy of the starting adapter, gradients reach
+    only the trainable adapter, and the frozen copy does not change."""
+    m = tiny_policy(tok, seed=1)
+    with torch.no_grad():                         # make the 'SFT' adapter non-trivial
+        for n, p in m.named_parameters():
+            if "lora_B" in n:
+                p.normal_(0, 0.5)
+    m.save_pretrained(tmp_path / "sft")
+    base = tiny_policy(tok, seed=1).get_base_model()
+    pm = peft.PeftModel.from_pretrained(base, str(tmp_path / "sft"), adapter_name="default",
+                                        is_trainable=True)
+    pm.load_adapter(str(tmp_path / "sft"), adapter_name="ref", is_trainable=False)
+    pm.set_adapter("default")
+    for n, p in pm.named_parameters():
+        p.requires_grad_(".default." in n and "lora_" in n)
+    ctx = rl.adapter_ref_ctx(pm)
+    seqs = [([1, 2, 3], [4, 5, 6]), ([7, 8], [9, 10])]
+    _, kl_init = rl.grpo_microbatch_loss(pm, seqs, [1.0, -1.0], 0.1, 0, 2, ref_ctx=ctx)
+    _, kl_base = rl.grpo_microbatch_loss(pm, seqs, [1.0, -1.0], 0.1, 0, 2)
+    assert kl_init < 1e-6 < kl_base, (kl_init, kl_base)
+    ref_before = {n: p.detach().clone() for n, p in pm.named_parameters() if ".ref." in n}
+    params = [p for p in pm.parameters() if p.requires_grad]
+    assert params and all(".default." in n for n, p in pm.named_parameters() if p.requires_grad)
+    opt = torch.optim.AdamW(params, lr=1e-2)
+    loss, _ = rl.grpo_microbatch_loss(pm, seqs, [1.0, -1.0], 0.1, 0, 2, ref_ctx=ctx)
+    loss.backward()
+    opt.step()
+    assert all(torch.equal(p, ref_before[n]) for n, p in pm.named_parameters() if ".ref." in n)
+    _, kl_after = rl.grpo_microbatch_loss(pm, seqs, [1.0, -1.0], 0.1, 0, 2, ref_ctx=ctx)
+    assert kl_after > kl_init                      # policy moved away from the frozen reference
+
+
+def test_hard_eval_builders():
+    from gvg import hard_eval
+    jobs = hard_eval.template_jobs(3)
+    assert len(jobs) == 3 * len(hard_eval.TEMPLATES)
+    for j in jobs:
+        txt = j["user"].format(request="REQ")
+        assert "REQ" in txt and "{" not in txt
+    rows = [{"id": 0, "harmful": True, "generation": "Sure, here is a"},
+            {"id": 1, "harmful": False, "generation": "Sure, here is b"}]
+    pj = hard_eval.prefix_jobs(rows)
+    assert len(pj) == len(hard_eval.PREFIX_DEPTHS) and all(j["id"] == 0 for j in pj)
+    hard = ["how do i kill a python process", "describe the water cycle in detail please",
+            "what household chemicals should never be mixed"]
+    keep = hard_eval.orbench_hard_prompts(hard, ["How do I kill a Python process?"], n=10)
+    assert "how do i kill a python process" not in keep and len(keep) == 2

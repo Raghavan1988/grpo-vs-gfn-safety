@@ -36,6 +36,7 @@ BEHAVIOR_SPECIFIC = None  # marker: text comes from the per-behavior HarmBench t
 
 @dataclass(frozen=True)
 class PrefillAttack:
+    """One named attack opener and the split in which it is allowed."""
     id: str
     family: str
     split: str
@@ -224,6 +225,7 @@ def sample_train_prefill(behavior_key: str, seed: int) -> PrefillAttack:
 
 
 def assert_no_heldout(attack_ids) -> None:
+    # This is a safety check against accidental train/evaluation contamination.
     """Call from training code on every attack id it uses."""
     bad = sorted({i for i in attack_ids if BY_ID[i].split != "train"})
     if bad:
@@ -231,6 +233,8 @@ def assert_no_heldout(attack_ids) -> None:
 
 
 def assert_no_heldout_phrases(phrase_ids) -> None:
+    # Random-pool IDs use a separate check because they are integers rather than
+    # names in the ``ATTACKS`` registry.
     """Call from training-data code on every RANDOM_PHRASES index it uses."""
     bad = sorted({i for i in phrase_ids if i not in RANDOM_TRAIN_IDS})
     if bad:

@@ -33,15 +33,21 @@ SOURCES = {
 
 
 def _words(s: str) -> set[str]:
+    # Word sets let us perform a simple, transparent overlap check without
+    # storing or comparing the actual held-out prompts in the repository.
     return set(re.sub(r"\W+", " ", s.lower()).split())
 
 
 def max_jaccard(text: str, pool: list[set[str]]) -> float:
+    # Jaccard similarity is intersection divided by union.  We compare against
+    # the most similar evaluation prompt and reject overly similar training data.
     t = _words(text)
     return max((len(t & p) / max(1, len(t | p)) for p in pool), default=0.0)
 
 
 def _download(cache_dir: str | None = None) -> dict:
+    # Downloads happen only when building splits, never during a training step.
+    # Hugging Face caching avoids downloading the same dataset repeatedly.
     import pandas as pd
     from huggingface_hub import hf_hub_download
 
@@ -62,6 +68,8 @@ def _download(cache_dir: str | None = None) -> dict:
 def build(seed: int = 0, n_harmful: int = 1000, n_benign: int = 500, n_math: int = 500,
           n_val: tuple[int, int, int] = (100, 50, 50), cache_dir: str | None = None,
           raw: dict | None = None) -> dict:
+    # Supplying ``raw`` is useful for deterministic unit tests and avoids network
+    # access; normal users leave it unset and fetch the published datasets.
     raw = raw or _download(cache_dir)
     rng = random.Random(seed)
     eval_pool = [_words(p) for p in raw["harmbench_eval"] + raw["xstest_eval"]]

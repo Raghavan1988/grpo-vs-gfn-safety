@@ -18,6 +18,8 @@ from gvg import data, prefill_attacks as pa  # noqa: E402
 
 
 def main(seed: int = 0):
+    # Build once, write the prompt files locally, and record only counts and hashes
+    # in git.  The prompts themselves may contain harmful material and stay ignored.
     d = data.build(seed=seed)
     out = ROOT / "outputs" / "data"
     out.mkdir(parents=True, exist_ok=True)

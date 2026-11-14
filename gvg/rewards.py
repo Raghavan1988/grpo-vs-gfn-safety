@@ -25,9 +25,13 @@ def compute_rewards(items: list[dict], replies: list[str], judge) -> list[dict]:
     judge(pairs) -> list of WildGuard dicts (gvg.wildguard.score). Only safety prompts are judged.
     Returns one dict per reply: reward plus diagnostics.
     """
+    # Keeping this alignment exact is important: a reward must belong to the
+    # same prompt/response pair that produced the sampled completion.
     assert len(items) == len(replies)
     idx = [i for i, x in enumerate(items) if x["kind"] in ("harmful", "benign")]
     wg = judge([(items[i]["prompt"], replies[i]) for i in idx]) if idx else []
+    # The judge is called only for safety examples, so map its shorter result
+    # list back to the original batch positions.
     wg_by = dict(zip(idx, wg))
     out = []
     for i, (x, reply) in enumerate(zip(items, replies)):

@@ -42,6 +42,8 @@ MAX_RESPONSE_TOKENS = 1024  # responses are clipped (WildGuard tokenizer) before
 
 
 def format_input(prompt: str, response: str) -> str:
+    # WildGuard expects this exact chat-style prompt.  Changing the wrapper can
+    # change its output even when the user prompt and answer stay the same.
     return TEMPLATE.format(prompt=prompt, response=response)
 
 
