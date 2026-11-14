@@ -4,6 +4,7 @@
     modal run train/modal_train.py --pipeline grpo                 # pure GRPO pilot
     modal run train/modal_train.py --pipeline sft+grpo             # rejection-sampling SFT, then GRPO
     modal run train/modal_train.py --pipeline sft                  # SFT only
+    modal run train/modal_train.py --pipeline tb --tau 0.1         # GFlowNet trajectory balance
 
 Layout: one H100 container holds the policy twice (vLLM for sampling, HF + PEFT for gradients);
 WildGuard (the training judge) runs in its own L40S container and is called per batch.
@@ -224,10 +225,14 @@ def _save_local(run_name, logs):
 
 @app.local_entrypoint()
 def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int = 0,
-         sft_epochs: int = 1, tests_only: bool = False, ref: str = ""):
-    """--pipeline grpo | sft | sft+grpo. Run names default to <pipeline>-s<seed>-<timestamp>.
+         sft_epochs: int = 1, tests_only: bool = False, ref: str = "", tau: float = 0.1,
+         length_norm: bool = False):
+    """--pipeline grpo | tb | sft | sft+grpo. Run names default to <pipeline>-s<seed>-<timestamp>.
     --ref base | init: KL reference for GRPO. Default: base for pure GRPO, init (the SFT adapter)
-    for sft+grpo, so its GRPO phase is measured against SFT rather than the untuned model."""
+    for sft+grpo, so its GRPO phase is measured against SFT rather than the untuned model.
+    --tau: trajectory-balance reward temperature (target pi_ref * exp(r / tau)); --pipeline tb
+    uses exactly the GRPO settings (prompts, mix, K, lr, LoRA, reference) except the loss.
+    --length-norm: TB only; divides the log-ratio by reply length (rescales tau, off by default)."""
     if tests_only:
         print(run_tests.remote())
         return
@@ -238,11 +243,17 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     if ref not in ("base", "init"):
         raise SystemExit("--ref must be base or init")
     gcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref))
+    tcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref, method="tb", tau=tau,
+                                length_norm=length_norm))
     scfg = asdict(rl.SFTConfig(epochs=sft_epochs, seed=seed))
     if pipeline == "grpo":
         if ref == "init":
             raise SystemExit("pure GRPO has no starting adapter; use --ref base")
         _save_local(base, train.remote(base, "grpo", tr, va, gcfg, None, sha))
+    elif pipeline == "tb":
+        if ref == "init":
+            raise SystemExit("TB from scratch has no starting adapter; use --ref base")
+        _save_local(base, train.remote(base, "grpo", tr, va, tcfg, None, sha))
     elif pipeline == "sft":
         _save_local(base, train.remote(base, "sft", tr, va, scfg, None, sha))
     elif pipeline == "sft+grpo":
@@ -250,4 +261,4 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
         _save_local(sft_name, train.remote(sft_name, "sft", tr, va, scfg, None, sha))
         _save_local(grpo_name, train.remote(grpo_name, "grpo", tr, va, gcfg, sft_name, sha))
     else:
-        raise SystemExit("--pipeline must be grpo, sft or sft+grpo")
+        raise SystemExit("--pipeline must be grpo, tb, sft or sft+grpo")

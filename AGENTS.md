@@ -52,7 +52,9 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
 4. **For AR decoding, TB with reference prior ≡ KL-regularized RL** (Tiapkin et al., Deleu et al.).
    AR comparison therefore tests optimizer / log Z estimation, not the objective. Say so in the paper.
 5. TB is unstable at this scale: length collapse, exploding grads with learned log Z,
-   instability for β < ~0.004 (TBA). Use batch-mean log Z estimate + length-normalized log-ratio.
+   instability for β < ~0.004 (TBA). Use batch-mean log Z estimate. Do NOT length-normalise the
+   log-ratio by default: with ~300-token replies it rescales τ by ~300× and turns WildGuard jitter
+   between equally safe replies into a 5–50 nat preference (the same noise problem as GRPO's).
 6. GRPO gets zero signal when all K responses agree (all refuse / all comply). Logged as
    `zero_var_group_frac` (0.25–0.56 in the 3-step check).
 7. **WildGuard is the training and refusal judge; the HarmBench classifier is the ASR judge.**
@@ -96,8 +98,10 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
 - Known issues to fix next: group-std normalisation amplifies WildGuard noise in all-safe groups;
   SFT + GRPO regularises toward the base model (undoes SFT); truncated SFT targets lack an
   end-of-turn token.
-- TB (to build in the same loop): batch-mean log Z(x) over K samples, length-normalised
-  log-ratio, β ∈ 3 values → freeze one. Compare against KL-regularised GRPO with matched β.
+- TB (built, `--pipeline tb`; `GRPOConfig(method="tb")`): same loop, prompts, rewards, LoRA and
+  reference as GRPO; loss = within-group variance of δ = log π/π_ref − r/τ (batch log Z, no length
+  normalisation by default, so the target is exactly π_ref·exp(r/τ)). Pilot τ ∈ {0.03, 0.1, 0.3},
+  freeze one, compare against GRPO on identical code.
 - Full: 200 steps × methods × 3 seeds.
 - Eval: `modal run baseline/modal_baseline.py --adapter <run> --attacks random-heldout`
   (held-out ASR, XSTest false refusal, GSM8K), plus tokens and semantic diversity.

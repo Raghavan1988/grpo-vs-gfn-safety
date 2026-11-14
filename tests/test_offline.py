@@ -323,3 +323,112 @@ def test_hard_eval_builders():
             "what household chemicals should never be mixed"]
     keep = hard_eval.orbench_hard_prompts(hard, ["How do I kill a Python process?"], n=10)
     assert "how do i kill a python process" not in keep and len(keep) == 2
+
+
+# ------------------------------------------------------------------ trajectory balance (GFlowNet)
+def test_tb_config_validation():
+    assert rl.GRPOConfig(method="tb").tau == 0.1
+    for bad in ({"method": "ppo"}, {"ref": "sft"}, {"tau": 0.0}):
+        with pytest.raises(ValueError):
+            rl.GRPOConfig(**bad)
+
+
+def test_tb_microbatched_gradient_matches_textbook_loss(tok):
+    """Two-pass micro-batched TB (detached group mean) has the same gradient as the direct
+    within-group-variance loss with log Z_hat = -mean(delta) computed with autograd."""
+    torch.manual_seed(0)
+    m = tiny_policy(tok, seed=2)
+    with torch.no_grad():                         # move the policy away from the reference
+        for n, p in m.named_parameters():
+            if "lora_B" in n:
+                p.normal_(0, 0.3)
+    seqs = [([1, 2, 3], [4, 5, 6, 7]), ([1, 2, 3], [8, 9]), ([1, 2, 3], [10, 11, 12]), ([1, 2, 3], [13]),
+            ([5, 6], [7, 8, 9]), ([5, 6], [10, 11]), ([5, 6], [12, 13, 14, 15]), ([5, 6], [16, 17])]
+    rewards = [1.0, 0.0, 0.7, 0.2, 0.9, 0.9, 0.1, 0.5]
+    tau, G = 0.1, 4
+    params = [p for p in m.parameters() if p.requires_grad]
+
+    # (a) the implementation: stats pass, detached centers, micro-batches of 3 (splitting groups)
+    st = rl.tb_seq_stats(m, seqs, 0)
+    deltas = rl.tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, tau, True)
+    centers = rl.group_centers(deltas, G)
+    m.zero_grad()
+    total = 0.0
+    for i in range(0, 8, 3):
+        loss = rl.tb_microbatch_loss(m, seqs[i:i + 3], st["ref_sum"][i:i + 3], st["ntok"][i:i + 3],
+                                     rewards[i:i + 3], centers[i:i + 3], tau, True, 0, 8)
+        loss.backward()
+        total += loss.item()
+    g_impl = [p.grad.clone() for p in params]
+
+    # (b) textbook: delta with autograd, log Z_hat = -group mean (not detached), mean squared residual
+    m.zero_grad()
+    ids, att, cm = rl._pad_batch(seqs, 0)
+    mask = cm[:, 1:]
+    lp = rl.token_logprobs(m, ids, att)
+    with torch.no_grad(), m.disable_adapter():
+        ref = rl.token_logprobs(m, ids, att)
+    ntok = mask.sum(1)
+    delta = ((lp - ref) * mask).sum(1) / ntok - torch.tensor(rewards) / tau
+    resid = delta.view(2, G) - delta.view(2, G).mean(1, keepdim=True)
+    direct = (resid ** 2).mean()
+    direct.backward()
+    g_direct = [p.grad.clone() for p in params]
+
+    assert abs(total - direct.item()) < 1e-4 * max(1.0, direct.item())
+    for a, b in zip(g_impl, g_direct):
+        assert torch.allclose(a, b, atol=1e-5, rtol=1e-4)
+
+
+def test_tb_zero_loss_when_target_matched(tok):
+    """Policy == reference and equal rewards within each group: residuals are equal, loss 0."""
+    m = tiny_policy(tok)
+    seqs = [([1, 2], [3, 4]), ([1, 2], [5, 6, 7]), ([9], [10]), ([9], [11, 12])]
+    rewards = [0.3, 0.3, 1.0, 1.0]
+    st = rl.tb_seq_stats(m, seqs, 0)
+    assert max(abs(l - f) for l, f in zip(st["lp_sum"], st["ref_sum"])) < 1e-5
+    deltas = rl.tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, 0.1, True)
+    centers = rl.group_centers(deltas, 2)
+    loss = rl.tb_microbatch_loss(m, seqs, st["ref_sum"], st["ntok"], rewards, centers, 0.1, True, 0, 4)
+    assert loss.item() < 1e-8
+
+
+def test_tb_increases_rewarded_logprob(tok):
+    """End to end through train_grpo with method='tb': probability moves toward the rewarded reply."""
+    m = tiny_policy(tok)
+    eos = tok.convert_tokens_to_ids("<|im_end|>")
+    good = tok("#### 4", add_special_tokens=False)["input_ids"] + [eos]
+    bad = tok("#### 7", add_special_tokens=False)["input_ids"] + [eos]
+    items = [{"kind": "math", "prompt": f"What is 2+2? ({i})", "answer": "4", "prefill": ""} for i in range(4)]
+    # TB's optimum log-prob gap between the two replies is (1 - 0) / tau = 4 nats: it should move
+    # clearly toward it, and (unlike reward maximisation) not run far past it.
+    cfg = rl.GRPOConfig(method="tb", tau=0.25, steps=8, group_size=4, mix={"math": 2}, lr=5e-3,
+                        micro_batch=3, val_every=0, max_new_tokens=16)
+    pid = rl.encode_prompt(tok, items[0])
+
+    def margin():
+        with torch.no_grad():
+            ids, att, cm = rl._pad_batch([(pid, good), (pid, bad)], tok.pad_token_id)
+            s = (rl.token_logprobs(m, ids, att) * cm[:, 1:]).sum(1)
+            return (s[0] - s[1]).item()
+
+    before = margin()
+    logs = rl.train_grpo(m, tok, items, [], cfg, _fixed_generate(tok, good, bad),
+                         judge_fn=lambda pairs: [], log_fn=lambda s: None)
+    assert all("tb_loss" in l and "logZ_mean" in l for l in logs)
+    gain = margin() - before
+    assert 1.5 < gain < 4.0 + 1.0, (before, margin())
+
+
+def test_tb_target_scale_without_length_norm():
+    """Regression: by default the TB target is pi_ref * exp(r / tau), independent of reply length.
+    At the optimum residuals are equal within a group, so the sequence log-ratio gap between two
+    replies equals (r1 - r2) / tau. With length_norm the gap would scale with reply length."""
+    assert rl.GRPOConfig(method="tb").length_norm is False
+    tau = 0.1
+    # policy at the TB optimum: log-ratio = r / tau (+ shared constant), for replies of 300 / 20 tokens
+    lp_sum, ref_sum, ntok, r = [10.0 + 3.0, 0.0 + 3.0], [0.0, 0.0], [300.0, 20.0], [1.0, 0.0]
+    d = rl.tb_deltas(lp_sum, ref_sum, ntok, r, tau, False)
+    assert abs(d[0] - d[1]) < 1e-9                       # balanced: zero loss, regardless of length
+    d_norm = rl.tb_deltas(lp_sum, ref_sum, ntok, r, tau, True)
+    assert abs(d_norm[0] - d_norm[1]) > 5                # same policy is far from balance under length_norm

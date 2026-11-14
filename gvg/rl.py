@@ -18,6 +18,25 @@ KL penalty (the GRPO estimator without its clipping, which only matters for mult
 Reference policy (cfg.ref): "base" = LoRA disabled (the untuned model); "init" = the adapter the
 run started from (e.g. the SFT adapter), so GRPO is measured against SFT instead of pulling the
 model back toward the untuned one. Pure GRPO has no init adapter, so the two coincide.
+
+Trajectory balance (cfg.method = "tb", the GFlowNet objective). Same loop, prompts, rewards,
+sampling, LoRA and reference policy as GRPO; only the loss differs. Target distribution
+    R(x, y) = pi_ref(y|x) * exp(r(x, y) / tau)
+which is also the optimum of KL-regularised RL with beta = tau (Tiapkin et al.; Deleu et al.).
+For an autoregressive model each reply has a single generation path, so the backward policy is
+trivial and the TB residual of sample k in a prompt's group is
+    delta_k = [log pi(y_k|x) - log pi_ref(y_k|x)] / norm_k - r_k / tau
+with norm_k = 1 by default. cfg.length_norm = True divides by the reply length instead, but that
+changes the target to pi_ref * exp(len(y) * r / tau): with ~300-token replies tau would mean a
+~300x sharper preference, and WildGuard jitter between equally safe replies (~0.005) would become
+a 5-50 nat preference. So it is off by default; tau then has its KL-RL meaning (beta = tau). log Z(x) is not learned: it is estimated
+from the group as log Z_hat = -mean_k delta_k (batch / "VarGrad" estimate, as in TBA and GFlowRL),
+and the loss is the within-group variance of the residual
+    loss = mean_k (delta_k - mean_j delta_j)^2.
+Its gradient is 2 (delta_k - mean delta) * grad(log pi(y_k|x)) / norm_k: replies whose reward is
+higher than the group's, relative to how much more likely the policy already makes them than the
+reference, are pushed up. Two passes per step: a no-grad pass computes every delta (and the group
+means); a gradient pass then uses the detached group mean, so micro-batches may split groups.
 """
 
 from __future__ import annotations
@@ -59,6 +78,18 @@ class GRPOConfig:
     seed: int = 0
     val_every: int = 10                      # greedy validation every N steps (0 = off)
     save_every: int = 10
+    method: str = "grpo"                     # "grpo" | "tb" (trajectory balance / GFlowNet)
+    tau: float = 0.1                         # TB reward temperature: target pi_ref * exp(r / tau)
+    length_norm: bool = False                # TB: divide the log-ratio by reply length (rescales tau
+                                             # by ~reply length; see module docstring)
+
+    def __post_init__(self):
+        if self.method not in ("grpo", "tb"):
+            raise ValueError(f"method must be 'grpo' or 'tb', not {self.method!r}")
+        if self.ref not in ("base", "init"):
+            raise ValueError(f"ref must be 'base' or 'init', not {self.ref!r}")
+        if self.tau <= 0:
+            raise ValueError("tau must be positive")
 
 
 @dataclass
@@ -170,6 +201,57 @@ def grpo_microbatch_loss(model, seqs, adv, beta, pad_id, n_total, ref_ctx=None):
     loss = seq_loss.sum() / n_total
     kl_mean = ((kl * mask).sum(1) / ntok).mean().item()
     return loss, kl_mean
+
+
+def tb_seq_stats(model, seqs, pad_id, ref_ctx=None) -> dict:
+    """No-grad pass for trajectory balance: per sequence, summed reference and policy logprobs
+    over reply tokens, reply length, and the mean k3 KL (logged for comparison with GRPO)."""
+    import torch
+    dev = next(model.parameters()).device
+    ids, att, cm = (t.to(dev) for t in _pad_batch(seqs, pad_id))
+    mask = cm[:, 1:]
+    ctx = ref_ctx() if ref_ctx is not None else model.disable_adapter()
+    with torch.no_grad():
+        with ctx:
+            ref = token_logprobs(model, ids, att)
+        lp = token_logprobs(model, ids, att)
+    ntok = mask.sum(1).clamp(min=1.0)
+    d = ref - lp
+    k3 = ((torch.exp(d) - d - 1.0) * mask).sum(1) / ntok
+    return {"ref_sum": (ref * mask).sum(1).tolist(), "lp_sum": (lp * mask).sum(1).tolist(),
+            "ntok": ntok.tolist(), "kl": k3.tolist()}
+
+
+def tb_deltas(lp_sum, ref_sum, ntok, rewards, tau, length_norm) -> list[float]:
+    """TB residual per sample: length-normalised log pi/pi_ref minus r/tau."""
+    return [(l - f) / (n if length_norm else 1.0) - r / tau
+            for l, f, n, r in zip(lp_sum, ref_sum, ntok, rewards)]
+
+
+def group_centers(values: list[float], group_size: int) -> list[float]:
+    """Group mean of each value, broadcast back to every member (= -log Z_hat for TB)."""
+    out = []
+    for g in range(0, len(values), group_size):
+        v = values[g:g + group_size]
+        out += [sum(v) / len(v)] * len(v)
+    return out
+
+
+def tb_microbatch_loss(model, seqs, ref_sum, ntok, rewards, centers, tau, length_norm, pad_id,
+                       n_total):
+    """Gradient pass for trajectory balance, scaled by len(seqs)/n_total for accumulation.
+    centers are the detached group means of delta from the no-grad pass."""
+    import torch
+    dev = next(model.parameters()).device
+    ids, att, cm = (t.to(dev) for t in _pad_batch(seqs, pad_id))
+    mask = cm[:, 1:]
+    lp = token_logprobs(model, ids, att)
+    lp_sum = (lp * mask).sum(1)
+    t = lambda xs: torch.tensor(xs, dtype=torch.float, device=dev)
+    norm = t(ntok) if length_norm else torch.ones(len(seqs), device=dev)
+    delta = (lp_sum - t(ref_sum)) / norm - t(rewards) / tau
+    resid = delta - t(centers)
+    return (resid ** 2).sum() / n_total
 
 
 def sft_microbatch_loss(model, seqs, pad_id, n_total):
@@ -293,19 +375,43 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
 
         model.train()
         opt.zero_grad(set_to_none=True)
-        kls = []
-        for i in range(0, len(seqs), cfg.micro_batch):
-            loss, kl = grpo_microbatch_loss(model, seqs[i:i + cfg.micro_batch],
-                                            adv[i:i + cfg.micro_batch], cfg.beta, pad_id, len(seqs),
-                                            ref_ctx)
-            loss.backward()
-            kls.append(kl)
+        kls, extra = [], {}
+        mb = cfg.micro_batch
+        if cfg.method == "grpo":
+            for i in range(0, len(seqs), mb):
+                loss, kl = grpo_microbatch_loss(model, seqs[i:i + mb], adv[i:i + mb], cfg.beta,
+                                                pad_id, len(seqs), ref_ctx)
+                loss.backward()
+                kls.append(kl)
+        else:  # trajectory balance
+            st = {"ref_sum": [], "lp_sum": [], "ntok": [], "kl": []}
+            for i in range(0, len(seqs), mb):
+                part = tb_seq_stats(model, seqs[i:i + mb], pad_id, ref_ctx)
+                for k in st:
+                    st[k] += part[k]
+            rewards = [r["reward"] for r in rs]
+            deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau,
+                               cfg.length_norm)
+            centers = group_centers(deltas, cfg.group_size)
+            tb_loss = 0.0
+            for i in range(0, len(seqs), mb):
+                loss = tb_microbatch_loss(model, seqs[i:i + mb], st["ref_sum"][i:i + mb],
+                                          st["ntok"][i:i + mb], rewards[i:i + mb],
+                                          centers[i:i + mb], cfg.tau, cfg.length_norm, pad_id,
+                                          len(seqs))
+                loss.backward()
+                tb_loss += loss.item()
+            kls = [sum(st["kl"]) / len(st["kl"])]
+            lr_tok = [(l - f) / n for l, f, n in zip(st["lp_sum"], st["ref_sum"], st["ntok"])]
+            extra = {"tb_loss": tb_loss,
+                     "logZ_mean": -sum(centers[::cfg.group_size]) / (len(centers) // cfg.group_size),
+                     "logratio_per_token": sum(lr_tok) / len(lr_tok)}
         gnorm = torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip).item()
         opt.step()
 
         rec = {"step": step, "reward_mean": sum(r["reward"] for r in rs) / len(rs),
                **_summarise(items, rs), "zero_var_group_frac": zero_frac,
-               "kl": sum(kls) / len(kls), "grad_norm": gnorm,
+               "kl": sum(kls) / len(kls), "grad_norm": gnorm, **extra,
                "resp_len": sum(len(c) for _, c in seqs) / len(seqs),
                "truncated_frac": sum(len(c) >= cfg.max_new_tokens for _, c in seqs) / len(seqs),
                "t_gen": round(t_gen, 1), "t_judge": round(t_judge, 1),
