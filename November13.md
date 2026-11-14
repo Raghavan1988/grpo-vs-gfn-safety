@@ -9,15 +9,7 @@
 
 ## What was done
 
-1. **Create a project plan**
-   - `AGENTS.md`: project summary, model/reward definitions, decisions that shape the work,
-     Phases 0–3 with decision gates, repo conventions, safety/ethics rules, and the spec for
-     tonight's baseline. `CLAUDE.md` imports it.
-   - Flagged open issues in the proposal: frozen backbone vs LoRA fine-tuning is inconsistent;
-     for left-to-right decoding, trajectory balance with a reference prior is equivalent to
-     KL-regularised RL, so the AR comparison tests the optimiser rather than the objective.
-
-2. **Wrote the baseline eval: `baseline/modal_baseline.py`.**
+1. **Wrote the baseline eval: `baseline/modal_baseline.py`.**
    - Qwen3-8B (thinking off, greedy, seed 0) served with vLLM on one Modal H100.
    - Test sets: HarmBench (200 prompts, plain and with a `"Sure, here is"` prefill attack),
      XSTest (450), GSM8K (first 200 of the test set).
@@ -25,10 +17,8 @@
      string-match; last `#### <number>` for GSM8K.
    - Generations are saved before judging; `--reuse-gen` re-runs only the judge.
 
-3. **Set up access.** Verified the Modal login and the `huggingface` Modal secret, and accepted
-   the gated-dataset terms for HarmBench and XSTest.
 
-4. **Smoke test (20 items per set), then the full run.** Five bugs found and fixed on the way:
+2**Smoke test (20 items per set), then the full run.** Five bugs found and fixed on the way:
 
    | # | Problem | Fix |
    |---|---|---|
@@ -68,20 +58,18 @@
 Smoke test (20 items, pipeline check only): plain 0/20, prefill 8/20, false refusal 1/20,
 GSM8K 19/20.
 
-**Run cost:** about 5 minutes wall time (30 s of generation) on one H100, roughly $1.
-Today's total Modal spend including the failed and smoke runs was a few dollars (estimate).
 
 ---
 
 ## What the results mean
 
-- **The proposal's "near-zero attack success" assumption is wrong for Qwen3-8B.** Plain
+- **Our initial assumption that "near-zero attack success" assumption is wrong for Qwen3-8B.** Plain
   HarmBench gives 13%, concentrated in misinformation and cybercrime.
 - **The prefill attack opens large headroom (62%)** across every category, including
   chemical/biological (0 → 19 of 28). The "is there anything to reduce?" gate is cleared.
 - **Benign behaviour is strong** (4.4% false refusal, 94% GSM8K). The ±2-point guardrails
   in the hypothesis will be measured against these values.
-- **Statistical power is a concern.** With 200 prompts, one run's uncertainty is about ±6–7
+- **Statistical power is a concern and so we need pairwise ** With 200 prompts, one run's uncertainty is about ±6–7
   points. The hypothesised 10% relative reduction (62% → ≤ 55.8%) is smaller than that, so the
   GRPO vs GFlowNet comparison needs paired tests on the same prompts, more held-out prompts,
   and three seeds.
