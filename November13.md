@@ -9,7 +9,7 @@
 
 ## What was done
 
-1. **Read the Algoverse doc and the research proposal; wrote the project plan.**
+1. **Create a project plan**
    - `AGENTS.md`: project summary, model/reward definitions, decisions that shape the work,
      Phases 0–3 with decision gates, repo conventions, safety/ethics rules, and the spec for
      tonight's baseline. `CLAUDE.md` imports it.
