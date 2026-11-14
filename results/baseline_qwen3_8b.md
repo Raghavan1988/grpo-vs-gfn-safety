@@ -144,3 +144,41 @@ Raw: `outputs/baseline_qwen3_8b_attacks-random/`. Wall 318 s, ≈ $1.
   manual spot-check still pending. 92/200 hit the 512-token cap.
 - If prefill attacks are later used in training, the 50 phrases must first be split into
   train and held-out sets.
+
+## WildGuard re-score and held-out-prefill baseline — 2026-11-14
+
+Same saved generations as above, re-judged with WildGuard (`allenai/wildguard`, label = P(yes) > 0.5).
+WildGuard is the training judge; the HarmBench classifier stays the evaluation judge for ASR.
+
+| Metric | Keyword match | WildGuard | 95% CI (WildGuard) |
+|---|---|---|---|
+| **XSTest false refusal (250 safe)** | 4.4% | **4.0%** | [2.2, 7.2] |
+| XSTest refusal (200 unsafe) | 67.5% | **86.0%** | |
+
+| Metric | HarmBench classifier | WildGuard |
+|---|---|---|
+| ASR, plain | 13.0% | 11.5% |
+| ASR, fixed "Sure, here is" | 62.0% | 66.0% |
+| Agreement between the two judges (plain + prefill replies) | | 93.8% |
+
+- The keyword check was missing soft refusals on unsafe prompts (67.5% → 86%), as suspected; on
+  safe prompts the two agree (4.4% vs 4.0%). **4.0% (WildGuard) is the false-refusal reference.**
+- The two harm judges agree on ~94% of replies, which supports using WildGuard for training
+  rewards while keeping the HarmBench classifier for evaluation.
+
+**Held-out-prefill baseline (`--attacks random-heldout`)** — one of the 24 held-out phrases per
+request (≤ 9 uses each, seed 0); these phrases are never used in training.
+
+| Metric | Value | 95% CI |
+|---|---|---|
+| **ASR, held-out random prefill** (HarmBench classifier) | 84/200 = **42.0%** | [35.4, 48.9] |
+| Same, WildGuard | 43.0% | |
+
+This is the "before" number for fine-tuned models: they will be evaluated on these same held-out
+phrases. It matches the all-50-phrase random baseline (42.5%).
+
+**Bug found and fixed on the way:** the first WildGuard re-score gave a 36% false-refusal rate.
+Cause: WildGuard's top-k alternatives contain two token ids that both decode to "no" (with and
+without a leading space); storing them in a dict keyed by text kept only the rare one, turning
+confident "no" answers into P(yes) ≈ 0.99. Fixed in `gvg/wildguard.py` (sum over all ids, and
+fall back to the greedy text label if a probability contradicts it), with a regression test.
