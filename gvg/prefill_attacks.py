@@ -138,15 +138,43 @@ RANDOM_PHRASES: tuple[str, ...] = (
 assert len(RANDOM_PHRASES) == 50 and len(set(RANDOM_PHRASES)) == 50
 
 
-def assign_random_prefills(n: int, seed: int = 0, max_uses: int = MAX_PHRASE_USES,
-                           phrases: tuple[str, ...] = RANDOM_PHRASES) -> list[int]:
-    """Phrase index for each of n requests: random, reproducible, each phrase <= max_uses times.
+# Groups follow the comments in RANDOM_PHRASES (index ranges).
+RANDOM_PHRASE_GROUPS: tuple[tuple[str, range], ...] = (
+    ("affirmative", range(0, 20)),
+    ("direct", range(20, 28)),
+    ("structured", range(28, 37)),
+    ("role", range(37, 41)),
+    ("framing", range(41, 46)),
+    ("anti_refusal", range(46, 50)),
+)
+assert sorted(i for _, r in RANDOM_PHRASE_GROUPS for i in r) == list(range(len(RANDOM_PHRASES)))
 
-    Every phrase gets max_uses slots; the slots are shuffled and the first n are taken.
+# Train / held-out split of the 50 phrases: alternate phrases within each group, so both sides
+# cover every group. Training may only ever use RANDOM_TRAIN_IDS; evaluation of fine-tuned models
+# uses RANDOM_HELDOUT_IDS (`--attacks random-heldout`).
+RANDOM_TRAIN_IDS: tuple[int, ...] = tuple(i for _, r in RANDOM_PHRASE_GROUPS for k, i in enumerate(r) if k % 2 == 0)
+RANDOM_HELDOUT_IDS: tuple[int, ...] = tuple(i for _, r in RANDOM_PHRASE_GROUPS for k, i in enumerate(r) if k % 2 == 1)
+assert not set(RANDOM_TRAIN_IDS) & set(RANDOM_HELDOUT_IDS)
+assert len(RANDOM_TRAIN_IDS) + len(RANDOM_HELDOUT_IDS) == len(RANDOM_PHRASES)
+
+
+def phrase_group(phrase_id: int) -> str:
+    return next(g for g, r in RANDOM_PHRASE_GROUPS if phrase_id in r)
+
+
+def assign_random_prefills(n: int, seed: int = 0, max_uses: int | None = MAX_PHRASE_USES,
+                           ids: tuple[int, ...] | None = None) -> list[int]:
+    """Phrase index (into RANDOM_PHRASES) for each of n requests: random, reproducible, and each
+    phrase used at most max_uses times. Every phrase gets max_uses slots; the slots are shuffled
+    and the first n are taken. ids restricts the pool (e.g. RANDOM_HELDOUT_IDS); max_uses=None
+    means the smallest cap that fits, ceil(n / len(ids)).
     """
-    if n > len(phrases) * max_uses:
-        raise ValueError(f"{n} requests need more than {len(phrases)} phrases x {max_uses} uses")
-    slots = [i for i in range(len(phrases)) for _ in range(max_uses)]
+    ids = tuple(range(len(RANDOM_PHRASES))) if ids is None else tuple(ids)
+    if max_uses is None:
+        max_uses = -(-n // len(ids))
+    if n > len(ids) * max_uses:
+        raise ValueError(f"{n} requests need more than {len(ids)} phrases x {max_uses} uses")
+    slots = [i for i in ids for _ in range(max_uses)]
     random.Random(seed).shuffle(slots)
     return slots[:n]
 
@@ -200,3 +228,14 @@ def assert_no_heldout(attack_ids) -> None:
     bad = sorted({i for i in attack_ids if BY_ID[i].split != "train"})
     if bad:
         raise ValueError(f"held-out prefill attacks used in training: {bad}")
+
+
+def assert_no_heldout_phrases(phrase_ids) -> None:
+    """Call from training-data code on every RANDOM_PHRASES index it uses."""
+    bad = sorted({i for i in phrase_ids if i not in RANDOM_TRAIN_IDS})
+    if bad:
+        raise ValueError(f"held-out prefill phrases used in training: {bad}")
+
+
+# Attack id for evaluation on held-out phrases only (models fine-tuned with prefill training).
+RANDOM_HELDOUT_ATTACK_ID = "random_heldout"
