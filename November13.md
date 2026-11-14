@@ -9,7 +9,7 @@
 
 ## What was done
 
-1. **Wrote the baseline eval: `baseline/modal_baseline.py`.**
+**Wrote the baseline eval: `baseline/modal_baseline.py`.**
    - Qwen3-8B (thinking off, greedy, seed 0) served with vLLM on one Modal H100.
    - Test sets: HarmBench (200 prompts, plain and with a `"Sure, here is"` prefill attack),
      XSTest (450), GSM8K (first 200 of the test set).
@@ -17,20 +17,6 @@
      string-match; last `#### <number>` for GSM8K.
    - Generations are saved before judging; `--reuse-gen` re-runs only the judge.
 
-
-2**Smoke test (20 items per set), then the full run.** Five bugs found and fixed on the way:
-
-   | # | Problem | Fix |
-   |---|---|---|
-   | 1 | vLLM 0.9.2 crashes on import with transformers ≥ 4.54 (`'aimv2' is already used`) | Pinned `transformers==4.53.2` |
-   | 2 | HarmBench and XSTest are gated; listing files works without access, downloading doesn't | Accepted terms; check access with a real download |
-   | 3 | XSTest's only split is named `test`, although its file is `train-*.parquet` | Kept `split="test"` |
-   | 4 | HarmBench classifier is Llama-2-13B with a 2,048-token context; script asked for 4,096 | `max_model_len=2048` |
-   | 5 | GSM8K parser took the first `####`, but Qwen writes headings like `#### 1. Donuts` | Use the last `#### <number>` |
-
-5. **Recorded results** in `results/baseline_qwen3_8b.md` and updated `AGENTS.md`.
-
----
 
 ## Results — untuned Qwen3-8B (full run)
 
