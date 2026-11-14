@@ -30,11 +30,14 @@ from gvg.rewards import compute_rewards
 class GRPOConfig:
     steps: int = 30
     group_size: int = 8                      # K rollouts per prompt
-    mix: dict = field(default_factory=lambda: {"harmful": 8, "benign": 4, "math": 4})  # prompts/step
+    # prompts per step by pool; "harmful_prefill" = harmful prompts with a prefill, and when it is
+    # present "harmful" means harmful prompts without one. Round 2 puts most of the batch on
+    # prefilled prompts, where replies differ and GRPO gets a signal.
+    mix: dict = field(default_factory=lambda: {"harmful_prefill": 8, "harmful": 2, "benign": 3, "math": 3})
     max_new_tokens: int = 512
     temperature: float = 1.0
-    lr: float = 1e-5
-    beta: float = 0.05                       # KL to the base model
+    lr: float = 1e-4                         # round 1 used 1e-5: KL stayed ~0.001, no learning
+    beta: float = 0.01                       # KL to the base model (round 1: 0.05)
     adv_eps: float = 1e-4
     micro_batch: int = 4
     grad_clip: float = 1.0
@@ -49,6 +52,7 @@ class SFTConfig:
     temperature: float = 0.7
     max_new_tokens: int = 512
     keep_threshold: float = 0.5              # keep best candidate if its reward >= this
+    keep_truncated_benign: bool = True       # a benign reply cut off at the cap is not a refusal
     epochs: int = 1
     lr: float = 1e-4
     batch_size: int = 16
@@ -142,12 +146,20 @@ def sft_microbatch_loss(model, seqs, pad_id, n_total):
     return seq_nll.sum() / n_total
 
 
+def pool_key(item: dict, split_prefill: bool) -> str:
+    """Sampling pool of an item; prefilled harmful prompts get their own pool if requested."""
+    if split_prefill and item["kind"] == "harmful" and item.get("prefill"):
+        return "harmful_prefill"
+    return item["kind"]
+
+
 class MixSampler:
-    """Cycles through each kind's shuffled prompts; every step draws cfg.mix[kind] of each."""
+    """Cycles through each pool's shuffled prompts; every step draws mix[pool] of each."""
 
     def __init__(self, items: list[dict], mix: dict, seed: int):
         self.rng = random.Random(seed)
-        self.pools = {k: [x for x in items if x["kind"] == k] for k in mix}
+        split = "harmful_prefill" in mix
+        self.pools = {k: [x for x in items if pool_key(x, split) == k] for k in mix}
         for k, v in self.pools.items():
             if not v:
                 raise ValueError(f"no training items of kind {k!r}")
@@ -261,20 +273,28 @@ def build_sft_set(tokenizer, items, cfg: SFTConfig, generate_fn, judge_fn, log_f
     flat = [c for cs in comps for c in cs]
     replies = [x.get("prefill", "") + _decode(tokenizer, c) for x, c in zip(flat_items, flat)]
     rs = compute_rewards(flat_items, replies, judge_fn)
-    keep, stats = [], {}
+    keep, stats, why = [], {}, {}
     K = cfg.samples_per_prompt
     for j, x in enumerate(items):
-        cand = [(rs[j * K + k]["reward"], k) for k in range(K)]
-        best_r, best_k = max(cand)
-        ok = best_r >= cfg.keep_threshold and len(flat[j * K + best_k]) < cfg.max_new_tokens
         tag = x["kind"] + ("_prefill" if x.get("prefill") else "")
+        allow_trunc = cfg.keep_truncated_benign and x["kind"] == "benign"
+        # best candidate among those passing the length rule
+        cand = [(rs[j * K + k]["reward"], k) for k in range(K)
+                if allow_trunc or len(flat[j * K + k]) < cfg.max_new_tokens]
         st = stats.setdefault(tag, [0, 0])
         st[1] += 1
-        if ok:
-            st[0] += 1
-            keep.append((pids[j], flat[j * K + best_k]))
+        w = why.setdefault(tag, {"all_truncated": 0, "low_reward": 0})
+        if not cand:
+            w["all_truncated"] += 1
+            continue
+        best_r, best_k = max(cand)
+        if best_r < cfg.keep_threshold:
+            w["low_reward"] += 1
+            continue
+        st[0] += 1
+        keep.append((pids[j], flat[j * K + best_k]))
     log_fn(json.dumps({"sft_kept": {k: f"{a}/{b}" for k, (a, b) in stats.items()},
-                       "sft_examples": len(keep)}))
+                       "sft_dropped": why, "sft_examples": len(keep)}))
     return keep, stats
 
 

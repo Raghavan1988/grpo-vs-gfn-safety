@@ -106,6 +106,40 @@ def test_rewards_mapping():
     assert rs[2]["reward"] == 1.0 and rs[3]["reward"] == 0.0
 
 
+def test_mix_sampler_prefill_pool():
+    items = ([{"kind": "harmful", "prefill": "Sure", "i": i} for i in range(4)]
+             + [{"kind": "harmful", "prefill": "", "i": i} for i in range(4)]
+             + [{"kind": "benign", "i": i} for i in range(4)] + [{"kind": "math", "i": i} for i in range(4)])
+    s = rl.MixSampler(items, {"harmful_prefill": 3, "harmful": 1, "benign": 1, "math": 1}, seed=0)
+    for _ in range(5):
+        b = s.draw()
+        assert all(x["prefill"] for x in b[:3]) and not b[3]["prefill"]
+    # without a harmful_prefill pool, "harmful" covers both
+    s2 = rl.MixSampler(items, {"harmful": 8}, seed=0)
+    assert sum(bool(x["prefill"]) for x in s2.draw()) == 4
+
+
+def test_round2_defaults():
+    c = rl.GRPOConfig()
+    assert c.lr == 1e-4 and c.beta == 0.01 and c.max_new_tokens == 512
+    assert c.mix == {"harmful_prefill": 8, "harmful": 2, "benign": 3, "math": 3}
+    assert rl.SFTConfig().keep_truncated_benign
+
+
+def test_sft_keeps_truncated_benign(tok):
+    long = list(range(1000, 1016))                  # 16 tokens == max_new_tokens: "truncated"
+    items = [{"kind": "benign", "prompt": "how do I kill a python process", "prefill": ""},
+             {"kind": "math", "prompt": "2+2", "answer": "4", "prefill": ""}]
+    gen = lambda pids, n, step, t, m: [[long for _ in range(n)] for _ in pids]
+    judge = lambda pairs: [{"harmful_request": 0.0, "response_refusal": 0.0, "harmful_response": 0.0}
+                           for _ in pairs]
+    cfg = rl.SFTConfig(samples_per_prompt=2, max_new_tokens=16)
+    keep, stats = rl.build_sft_set(tok, items, cfg, gen, judge, log_fn=lambda s: None)
+    assert stats["benign"] == [1, 1] and stats["math"] == [0, 1]   # truncated math still dropped
+    cfg2 = rl.SFTConfig(samples_per_prompt=2, max_new_tokens=16, keep_truncated_benign=False)
+    assert rl.build_sft_set(tok, items, cfg2, gen, judge, log_fn=lambda s: None)[1]["benign"] == [0, 1]
+
+
 def test_mix_sampler():
     items = [{"kind": k, "i": i} for k in ("harmful", "benign", "math") for i in range(5)]
     s = rl.MixSampler(items, {"harmful": 2, "benign": 1, "math": 1}, seed=0)

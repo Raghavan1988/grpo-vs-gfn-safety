@@ -60,8 +60,15 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
    two harm judges agree on ~94% of replies. Gotcha: WildGuard's top-k alternatives contain
    several token ids that decode to "no"/"yes" — aggregate over a *list*, never a dict keyed by
    text (that bug once produced a 36% false-refusal rate).
-8. **Training throughput (H100, 16 prompts × 8 replies, 384-token cap): ~35 s per GRPO step.**
-   35–52% of training replies hit the 384 cap; raise to 512 for the pilots.
+8. **Training throughput (H100, 16 prompts × 8 replies, 512-token cap): ~40–60 s per GRPO step.**
+   ~25–35% of training replies still hit the 512 cap.
+9. **Round 2 pure GRPO (lr 1e-4, KL 0.01, 30 steps) is the working GRPO baseline:** held-out
+   prefill ASR 42.0% → **4.5%**, XSTest false refusal 4.0% → **6.0%** (at the +2-point limit),
+   GSM8K 94% → 96%. SFT + GRPO was worse (10.0% / 9.2%). Round 1 (lr 1e-5) did not move the model.
+   Details: `results/pilots_round2_heldout.md`, `November14.md`.
+10. **At 4.5% held-out ASR there is no measurable room for GFlowNet on attack success.** Before
+   building the trajectory-balance trainer: harder evaluations (long harmful prefills, unseen
+   attack families) and a headline on over-refusal / diversity, agreed with the mentor.
 
 ## 3. Plan
 
@@ -84,8 +91,11 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
   base model (adapter disabled), one update per batch, group-normalised advantages.
 - SFT + GRPO (built): rejection-sampling SFT (K=4 per prompt, keep best if reward ≥ 0.5), then
   the same GRPO starting from the SFT adapter, still regularised to the base model.
-- Next: pilots `--pipeline grpo` and `--pipeline sft+grpo`, 30 steps each (~$10–15 total).
-  Gate: reward ↑, grad norm bounded, response length stable, val metrics move the right way.
+- Pilots done (2026-11-14). Round 1 (lr 1e-5, KL 0.05) did not learn; round 2 (lr 1e-4, KL 0.01,
+  8 prefilled harmful of 16 prompts/step) did. Defaults in `GRPOConfig` are the round-2 values.
+- Known issues to fix next: group-std normalisation amplifies WildGuard noise in all-safe groups;
+  SFT + GRPO regularises toward the base model (undoes SFT); truncated SFT targets lack an
+  end-of-turn token.
 - TB (to build in the same loop): batch-mean log Z(x) over K samples, length-normalised
   log-ratio, β ∈ 3 values → freeze one. Compare against KL-regularised GRPO with matched β.
 - Full: 200 steps × methods × 3 seeds.
