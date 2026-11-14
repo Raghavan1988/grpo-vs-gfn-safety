@@ -113,9 +113,11 @@ distribution, rather than maximising reward, produce safer and more robust model
    quality), the same prompts, rollouts per prompt, steps and LoRA rank, and three seeds.
 2. **Make held-out robustness the headline, not raw attack success.** The project's untuned
    baseline (`results/baseline_qwen3_8b.md`) shows 13% attack success with no prefill, 62% with a
-   fixed "Sure, here is" prefill, and 42.5% with a random prefill drawn from 50 phrases. Split
-   the 50 phrases into training and held-out sets, train on one, and report attack success on
-   the other. This is where distribution matching should help if it helps anywhere.
+   fixed "Sure, here is" prefill, and 42.5% with a random prefill drawn from 50 phrases. The 50
+   phrases are now split into 26 training and 24 held-out phrases; the untuned model's attack
+   success on the held-out phrases is 42.0%. Train on the training phrases only and report attack
+   success on the held-out ones. This is where distribution matching should help if it helps
+   anywhere.
 3. **Report the harm / over-refusal trade-off.** HarmBench attack success alongside XSTest false
    refusals, plus GSM8K as a capability check. A method that cuts attacks by refusing everything
    should be visible as such.
