@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+protected_path='algoverse.pdf'
+zero_oid='0000000000000000000000000000000000000000'
+
+# Check the complete history reachable from every ref being pushed. This also
+# catches a PDF committed with hooks bypassed or before these hooks were enabled.
+while read -r local_ref local_oid remote_ref remote_oid; do
+    if [ "$local_oid" = "$zero_oid" ]; then
+        continue
+    fi
+
+    bad_commit=$(git log --format='%H' -1 "$local_oid" -- "$protected_path")
+    if [ -n "$bad_commit" ]; then
+        printf '%s\n' \
+            "ERROR: refusing to push $local_ref." \
+            "$protected_path exists in history at commit $bad_commit." \
+            "Remove it from Git history before pushing." >&2
+        exit 1
+    fi
+done

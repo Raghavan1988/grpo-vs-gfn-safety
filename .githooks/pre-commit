@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+protected_path='algoverse.pdf'
+
+# Block the commit whenever the protected PDF exists in the index. A staged
+# deletion is allowed so the file can be removed if it is ever added by mistake.
+if git ls-files --cached --error-unmatch -- "$protected_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+        "ERROR: $protected_path is protected and cannot be committed." \
+        "Remove it from the index with: git rm --cached -- $protected_path" >&2
+    exit 1
+fi
