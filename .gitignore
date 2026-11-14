@@ -1,0 +1,5 @@
+outputs/
+*.jsonl
+__pycache__/
+.env
+/algoverse.pdf
