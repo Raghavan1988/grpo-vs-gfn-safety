@@ -16,8 +16,9 @@ Raw outputs are in `outputs/` (gitignored). Related: `results/baseline_qwen3_8b.
 All use LoRA rank 32 on all attention and MLP layers (~87M trainable parameters); base weights
 are frozen.
 
-> **SFT-only adapter not yet evaluated.** The adapter after the SFT stage alone
-> (`pilot2-sftgrpo-s0-sft`) has not been run on the test set, so it is not compared here.
+> **Update (2026-11-15):** the SFT-only adapter, SFT + GRPO rerun on current code (both KL
+> references), GRPO v3 and the GFlowNet (TB) runs are in `results/experiments_2026-11-15.md`.
+> The SFT + GRPO over-refusal below (OR-Bench-Hard 50%) was mostly a reward-noise bug since fixed.
 
 ---
 
