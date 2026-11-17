@@ -40,7 +40,8 @@ UNKNOWN = 0.5  # WildGuard produced no answer for a field (rare): neutral reward
 def compute_rewards(items: list[dict], replies: list[str], judge) -> list[dict]:
     """items[i] has kind / prompt / prefill / answer; replies[i] is the full visible reply.
 
-    judge(pairs) -> list of WildGuard dicts (gvg.wildguard.score). Only safety prompts are judged.
+    judge(pairs) -> list of WildGuard dicts (gvg.wildguard.score). Only safety prompts are judged,
+    and each distinct (prompt, reply) pair is sent once.
     Returns one dict per reply: reward plus diagnostics.
 
     Args:
@@ -68,13 +69,24 @@ def compute_rewards(items: list[dict], replies: list[str], judge) -> list[dict]:
     # enumerate(items) yields (position, item) pairs.  Maths items need no judge.
     idx = [i for i, x in enumerate(items) if x["kind"] in ("harmful", "benign")]
     # Send all safety (prompt, reply) pairs to the judge in ONE call (much faster than one call
-    # per reply).  The "... if idx else []" part skips the call when there are no safety items.
-    wg = judge([(items[i]["prompt"], replies[i]) for i in idx]) if idx else []
-    # The judge is called only for safety examples, so map its shorter result
-    # list back to the original batch positions.
-    # zip pairs the k-th position with the k-th judge result; dict() turns those pairs into
-    # a lookup table {batch position: WildGuard result}.
-    wg_by = dict(zip(idx, wg))
+    # per reply); the call is skipped when there are no safety items.
+    # Identical (prompt, reply) pairs are judged once.  With K samples per prompt, short refusals
+    # such as "I can't help with that." are often repeated word for word inside a group (and
+    # more so as training converges), so this saves judge time.  It also guarantees that
+    # identical replies get identical rewards: the judge's GPU arithmetic is not bit-reproducible,
+    # and jitter between two copies of the same reply would be pure noise in the training signal.
+    # dict.fromkeys keeps the first occurrence of each pair, in order (a dict cannot hold
+    # duplicate keys), so `unique` is the de-duplicated list of pairs.
+    pairs = [(items[i]["prompt"], replies[i]) for i in idx]
+    unique = list(dict.fromkeys(pairs))
+    wg = judge(unique) if unique else []
+    if len(wg) != len(unique):
+        # A judge that drops or adds results would silently shift rewards onto the wrong replies.
+        raise ValueError(f"judge returned {len(wg)} results for {len(unique)} pairs")
+    # Lookup table from a pair to its WildGuard result, then from each batch position to the
+    # result of its pair.  zip pairs the k-th entry of one list with the k-th of the other.
+    by_pair = dict(zip(unique, wg))
+    wg_by = {i: by_pair[pair] for i, pair in zip(idx, pairs)}
     out = []
     # Walk through items and replies side by side; i is the batch position.
     for i, (x, reply) in enumerate(zip(items, replies)):

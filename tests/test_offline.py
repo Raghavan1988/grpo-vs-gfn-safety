@@ -223,6 +223,40 @@ def test_rewards_mapping():
     assert rs[2]["reward"] == 1.0 and rs[3]["reward"] == 0.0
 
 
+def test_rewards_judge_each_distinct_pair_once():
+    """Identical (prompt, reply) pairs reach the judge once and share one result, so repeated
+    refusals inside a group cost one judge call and cannot receive different (jittered) rewards.
+    The same reply to a DIFFERENT prompt is still judged separately."""
+    items = ([{"kind": "harmful", "prompt": "h1"}] * 4 + [{"kind": "benign", "prompt": "b1"}] * 2
+             + [{"kind": "math", "prompt": "m", "answer": "4"}] + [{"kind": "harmful", "prompt": "h2"}])
+    replies = ["No.", "No.", "Sure: step one", "No.", "No.", "Of course!", "#### 4", "No."]
+    calls = []
+
+    def judge(pairs):
+        """Fake judge with jitter: every result differs, like an unreproducible GPU judge."""
+        calls.append(list(pairs))
+        return [{"harmful_request": None, "response_refusal": float(r == "No."),
+                 "harmful_response": 0.5 * float("step" in r) + 0.001 * k}
+                for k, (_, r) in enumerate(pairs)]
+
+    rs = rewards.compute_rewards(items, replies, judge)
+    # One call with 5 distinct pairs instead of 7, in first-seen order.
+    assert calls == [[("h1", "No."), ("h1", "Sure: step one"), ("b1", "No."), ("b1", "Of course!"),
+                      ("h2", "No.")]]
+    # The three identical replies to h1 share one reward; the harmful one scores lower.
+    assert rs[0]["reward"] == rs[1]["reward"] == rs[3]["reward"] == 1.0
+    assert abs(rs[2]["reward"] - (1 - 0.501)) < 1e-9
+    # Results are mapped back to the right positions and kinds.
+    assert [r["kind"] for r in rs] == [x["kind"] for x in items]
+    assert rs[4]["reward"] == 0.0 and rs[5]["reward"] == 1.0 and rs[6]["reward"] == 1.0
+    assert abs(rs[7]["reward"] - (1 - 0.004)) < 1e-9      # same text, other prompt: own result
+    # A judge that returns the wrong number of results is an error, not a silent misalignment.
+    with pytest.raises(ValueError):
+        rewards.compute_rewards(items, replies, lambda pairs: [])
+    # No safety items: the judge is not called at all.
+    rewards.compute_rewards(items[6:7], replies[6:7], lambda pairs: 1 / 0)
+
+
 def test_mix_sampler_prefill_pool():
     """MixSampler builds each training batch with a fixed number of prompts from each pool. When
     the mix names a "harmful_prefill" pool, prefilled harmful prompts (where the reply is forced
