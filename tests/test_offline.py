@@ -747,6 +747,70 @@ def test_length_sorted_microbatches_same_gradient_less_padding(tok):
         assert all(math.isclose(e1[k], e0[k], rel_tol=1e-4, abs_tol=1e-5) for k in e0), (e1, e0)
 
 
+def test_nonfinite_gradient_is_skipped_not_applied(tok, monkeypatch):
+    """A NaN gradient (e.g. an exp() overflow) must not reach the optimizer: one such update
+    would turn every LoRA weight, and AdamW's running averages, into NaN for the rest of a paid
+    run. The poisoned step is skipped and logged; training then continues normally. A streak of
+    skipped steps stops the run instead of paying for more."""
+    eos = tok.convert_tokens_to_ids("<|im_end|>")
+    good = tok("#### 4", add_special_tokens=False)["input_ids"] + [eos]
+    bad = tok("#### 7", add_special_tokens=False)["input_ids"] + [eos]
+    items = [{"kind": "math", "prompt": f"2+2? ({i})", "answer": "4", "prefill": ""} for i in range(4)]
+    gen = _fixed_generate(tok, good, bad)
+    lora = lambda m: {n: p.detach().clone() for n, p in m.named_parameters() if "lora_" in n}
+    # Wrap each method's micro-batch loss so that chosen training steps produce NaN.
+    real = {"grpo": rl.grpo_microbatch_loss, "tb": rl.tb_microbatch_loss, "sft": rl.sft_microbatch_loss}
+    poison = {"on": False}
+
+    def wrap(name):
+        def f(*a, **k):
+            out = real[name](*a, **k)
+            if not poison["on"]:
+                return out
+            # GRPO returns (loss, kl); the others return the loss alone.
+            return (out[0] * float("nan"), out[1]) if name == "grpo" else out * float("nan")
+        return f
+    for name in real:
+        monkeypatch.setattr(rl, f"{name}_microbatch_loss", wrap(name))
+
+    for method in ("grpo", "tb"):
+        cfg = rl.GRPOConfig(method=method, tau=0.5, steps=4, group_size=4, mix={"math": 2},
+                            lr=5e-3, micro_batch=4, val_every=0, save_every=1, max_new_tokens=16)
+        m, snaps = tiny_policy(tok), {}
+
+        def save(step, opt):
+            snaps[step] = lora(m)
+            poison["on"] = step == 1          # poison exactly step 2 (the step after save 1)
+        logs = rl.train_grpo(m, tok, items, [], cfg, gen, lambda p: [], log_fn=lambda s: None,
+                             save_fn=save)
+        assert [l["update_skipped"] for l in logs] == [False, True, False, False], method
+        assert math.isnan(logs[1]["grad_norm"])
+        # Step 2 changed nothing; steps 3 and 4 trained again, and nothing is NaN.
+        assert all(torch.equal(snaps[1][n], snaps[2][n]) for n in snaps[1])
+        assert any(not torch.equal(snaps[2][n], snaps[4][n]) for n in snaps[2])
+        assert all(torch.isfinite(v).all() for v in snaps[4].values())
+        assert all(math.isfinite(l["grad_norm"]) for l in logs[2:])
+
+        # Every step poisoned: stop after MAX_SKIPPED_UPDATES steps, weights still finite.
+        poison["on"], m, seen = True, tiny_policy(tok), []
+        with pytest.raises(RuntimeError, match="non-finite"):
+            rl.train_grpo(m, tok, items, [], rl.GRPOConfig(**{**rl.config_dict(cfg), "steps": 10}),
+                          gen, lambda p: [], log_fn=seen.append)
+        assert len(seen) == rl.MAX_SKIPPED_UPDATES
+        assert all(torch.isfinite(v).all() for v in lora(m).values())
+        poison["on"] = False
+
+    # SFT uses the same guard.
+    m = tiny_policy(tok)
+    before = lora(m)
+    poison["on"] = True
+    scfg = rl.SFTConfig(samples_per_prompt=1, epochs=1, batch_size=2, micro_batch=2, max_new_tokens=16)
+    logs = rl.train_sft(m, tok, [(rl.encode_prompt(tok, x), good) for x in items], scfg,
+                        log_fn=lambda s: None)
+    assert [l["update_skipped"] for l in logs] == [True, True]
+    assert all(torch.equal(before[n], v) for n, v in lora(m).items())
+
+
 def test_tb_microbatched_gradient_matches_textbook_loss(tok):
     """Two-pass micro-batched TB (detached group mean) has the same gradient as the direct
     within-group-variance loss with log Z_hat = -mean(delta) computed with autograd.

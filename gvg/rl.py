@@ -797,6 +797,45 @@ def padding_fraction(seqs, batches: list[list[int]]) -> float:
     return 1.0 - real / total if total else 0.0
 
 
+# After this many optimizer updates in a row are skipped for a non-finite gradient, training
+# stops: one bad batch is survivable, but a streak means the run itself is broken and every
+# further step would pay for sampling and judging without learning anything.
+MAX_SKIPPED_UPDATES = 3
+
+
+def clipped_step(opt, params, grad_clip: float) -> tuple[float, bool]:
+    """Clip the accumulated gradient and apply one optimizer update, unless it is not finite.
+
+    If the overall gradient length (norm) exceeds grad_clip, it is scaled down to grad_clip so
+    one unusual batch cannot make a huge, destabilising step.
+
+    A gradient containing NaN or infinity (e.g. an overflow in exp() of a huge log-ratio, a
+    known risk for trajectory balance) must never reach the optimizer: clipping cannot repair it
+    (NaN times anything is NaN), a single such update turns every LoRA weight into NaN, and
+    AdamW's running averages would stay NaN afterwards, so the rest of a paid run would be
+    lost. In that case the update is skipped and the gradients are cleared; the weights and the
+    optimizer state stay exactly as they were.
+
+    Returns:
+        (gnorm, skipped): the gradient norm BEFORE clipping (for logging), and whether the
+        update was skipped.
+    """
+    import torch
+    gnorm = torch.nn.utils.clip_grad_norm_(params, grad_clip).item()
+    if not math.isfinite(gnorm):
+        opt.zero_grad(set_to_none=True)
+        return gnorm, True
+    opt.step()                               # apply one AdamW update using the accumulated .grad
+    return gnorm, False
+
+
+def _check_skip_streak(streak: int, where: str):
+    """Stop training after MAX_SKIPPED_UPDATES consecutive skipped updates (see above)."""
+    if streak >= MAX_SKIPPED_UPDATES:
+        raise RuntimeError(f"{streak} consecutive updates skipped for non-finite gradients "
+                           f"({where}); stopping instead of paying for steps that cannot learn")
+
+
 def accumulate_grpo_grads(model, seqs, adv, cfg: GRPOConfig, pad_id, ref_ctx=None):
     """Backpropagate the GRPO loss of one training step, micro-batch by micro-batch.
 
@@ -873,6 +912,8 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
     Each step: draw 16 prompts -> generate group_size (8) replies each with generate_fn ->
     score all 128 with the judge -> compute the loss in micro-batches, accumulating gradients
     -> clip gradients -> one AdamW update of the LoRA weights -> log metrics.
+    A step whose gradient is not finite is logged with "update_skipped": true and leaves the
+    weights untouched; MAX_SKIPPED_UPDATES such steps in a row raise RuntimeError.
     This is "on-policy": every step's replies come from the current model, freshly sampled.
     (generate_fn is expected to use the latest adapter weights; on Modal the current
     adapter is saved and loaded into vLLM before sampling.)
@@ -915,7 +956,7 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
     # Resuming: replay the sampler so the next draw is the one step start_step + 1 would get.
     for _ in range(start_step):
         sampler.draw()
-    logs = []
+    logs, skip_streak = [], 0
     # Validate once before training (step 0) to get a baseline (not repeated when resuming).
     if val_items and cfg.val_every and start_step == 0:
         # {"step": 0, **d} builds a new dict with "step" plus every key/value of d.
@@ -955,17 +996,15 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         else:  # trajectory balance
             kl, extra = accumulate_tb_grads(model, seqs, rewards, cfg, pad_id, ref_ctx)
         # ---- 4. update the LoRA weights ----
-        # If the overall gradient length (norm) exceeds grad_clip, scale it down to grad_clip
-        # so one unusual batch cannot make a huge, destabilising step. Returns the norm BEFORE
-        # clipping, which we log.
-        gnorm = torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip).item()
-        opt.step()                           # apply one AdamW update using the accumulated .grad
+        # Clip, then update; a non-finite gradient is skipped instead (see clipped_step).
+        gnorm, skipped = clipped_step(opt, params, cfg.grad_clip)
+        skip_streak = skip_streak + 1 if skipped else 0
 
         # ---- 5. log ----
         # `**d` inside a dict literal merges all of d's entries into the new dict.
         rec = {"step": step, "reward_mean": sum(rewards) / len(rewards),
                **_summarise(items, rs), "zero_var_group_frac": zero_frac,
-               "kl": kl, "grad_norm": gnorm, **extra,
+               "kl": kl, "grad_norm": gnorm, "update_skipped": skipped, **extra,
                # average reply length in tokens, and fraction cut off at max_new_tokens
                "resp_len": sum(len(c) for _, c in seqs) / len(seqs),
                "truncated_frac": sum(len(c) >= cfg.max_new_tokens for _, c in seqs) / len(seqs),
@@ -976,6 +1015,7 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
             rec.update(evaluate(tokenizer, val_items, generate_fn, judge_fn, step, cfg.max_new_tokens))
         logs.append(rec)
         log_fn(json.dumps(rec))
+        _check_skip_streak(skip_streak, f"step {step}")
         # Save the adapter periodically and always at the final step.
         # (save_every = 0 means "final step only"; the check also avoids dividing by zero.)
         if save_fn and ((cfg.save_every and step % cfg.save_every == 0) or step == cfg.steps):
@@ -1057,7 +1097,7 @@ def train_sft(model, tokenizer, examples, cfg: SFTConfig, log_fn=print) -> list[
     params = [p for p in model.parameters() if p.requires_grad]    # LoRA weights only
     opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=0.0)
     rng = random.Random(cfg.seed)
-    logs, step = [], 0
+    logs, step, skip_streak = [], 0, 0
     for ep in range(cfg.epochs):
         order = examples[:]                  # copy, so shuffling does not change the caller's list
         rng.shuffle(order)
@@ -1072,12 +1112,14 @@ def train_sft(model, tokenizer, examples, cfg: SFTConfig, log_fn=print) -> list[
                 loss = sft_microbatch_loss(model, batch[i:i + cfg.micro_batch], pad_id, len(batch))
                 loss.backward()
                 tot += loss.item()           # total = mean loss over the batch, for logging
-            gnorm = torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip).item()
-            opt.step()
+            gnorm, skipped = clipped_step(opt, params, cfg.grad_clip)
+            skip_streak = skip_streak + 1 if skipped else 0
             step += 1
-            rec = {"sft_step": step, "epoch": ep, "loss": tot, "grad_norm": gnorm}
+            rec = {"sft_step": step, "epoch": ep, "loss": tot, "grad_norm": gnorm,
+                   "update_skipped": skipped}
             logs.append(rec)
             log_fn(json.dumps(rec))
+            _check_skip_streak(skip_streak, f"SFT step {step}")
     return logs
 
 
