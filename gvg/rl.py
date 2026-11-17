@@ -119,6 +119,9 @@ class GRPOConfig:
     adv_eps: float = 1e-4                    # added to the std so we never divide by zero
     adv_min_std: float = 0.05                # groups with reward std below this carry no signal
     micro_batch: int = 4                     # sequences per forward/backward pass (GPU memory)
+    sort_by_length: bool = True              # micro-batch sequences of similar length together:
+                                             # same gradient, fewer padded positions (see
+                                             # microbatch_indices)
     grad_clip: float = 1.0                   # max total gradient norm (see clip_grad_norm_)
     seed: int = 0                            # makes prompt order and init reproducible
     val_every: int = 10                      # greedy validation every N steps (0 = off)
@@ -757,6 +760,43 @@ def adapter_ref_ctx(model, ref_name: str = "ref", active: str = "default"):
     return ctx
 
 
+def microbatch_indices(seqs, micro_batch: int, sort_by_length: bool = True) -> list[list[int]]:
+    """Split one step's sequences into micro-batches, as lists of positions in ``seqs``.
+
+    Every micro-batch is padded to its longest sequence, and the model spends compute on padded
+    positions just as on real ones. Reply lengths vary a lot (a 20-token refusal next to a
+    512-token answer), so taking sequences in sampling order wastes much of each forward and
+    backward pass on padding. With sort_by_length the sequences are micro-batched in order of
+    total length (prompt + reply), so neighbours have similar lengths and little padding.
+
+    This changes cost only, not the result: the step's gradient is the SUM over all sequences
+    (each loss is divided by the step's total), so it does not depend on how sequences are
+    grouped, apart from floating-point rounding. Peak memory is unchanged too, since the longest
+    sequence set the size of its micro-batch before as well.
+
+    Example with lengths [10, 500, 12, 480] and micro_batch 2: sampling order pads to
+    2 * 500 + 2 * 480 = 1960 positions for 1002 real tokens; sorted order ([0, 2], [3, 1]) pads
+    to 2 * 12 + 2 * 500 = 1024.
+    """
+    order = list(range(len(seqs)))
+    if sort_by_length:
+        # sorted is stable: sequences of equal length keep their sampling order, so the
+        # batching is deterministic (needed for resumed runs to match uninterrupted ones).
+        order.sort(key=lambda i: len(seqs[i][0]) + len(seqs[i][1]))
+    return [order[i:i + micro_batch] for i in range(0, len(order), micro_batch)]
+
+
+def padding_fraction(seqs, batches: list[list[int]]) -> float:
+    """Fraction of the positions the model processes that are padding, for the given batching.
+
+    0.0 means no wasted compute; 0.4 means 40% of every forward/backward pass is padding.
+    """
+    real = sum(len(p) + len(c) for p, c in seqs)
+    # Each micro-batch is a rectangle: (number of sequences) x (its longest sequence).
+    total = sum(len(b) * max(len(seqs[i][0]) + len(seqs[i][1]) for i in b) for b in batches)
+    return 1.0 - real / total if total else 0.0
+
+
 def accumulate_grpo_grads(model, seqs, adv, cfg: GRPOConfig, pad_id, ref_ctx=None):
     """Backpropagate the GRPO loss of one training step, micro-batch by micro-batch.
 
@@ -766,17 +806,21 @@ def accumulate_grpo_grads(model, seqs, adv, cfg: GRPOConfig, pad_id, ref_ctx=Non
     full-batch mean. The caller clears the gradients before and steps the optimizer after.
 
     Returns:
-        (kl, extra): the mean of the micro-batches' per-token KL (logged), and an empty dict
-        (GRPO has no method-specific metrics; TB does, see accumulate_tb_grads).
+        (kl, extra): the mean per-token KL over sequences (logged), and {"pad_frac": fraction
+        of processed positions that were padding}.
     """
-    mb, kls = cfg.micro_batch, []
-    for i in range(0, len(seqs), mb):
-        loss, kl = grpo_microbatch_loss(model, seqs[i:i + mb], adv[i:i + mb], cfg.beta, pad_id,
-                                        len(seqs), ref_ctx)
+    batches = microbatch_indices(seqs, cfg.micro_batch, cfg.sort_by_length)
+    kl_sum = 0.0
+    for idx in batches:
+        # [seqs[i] for i in idx] picks this micro-batch's sequences (and their advantages).
+        loss, kl = grpo_microbatch_loss(model, [seqs[i] for i in idx], [adv[i] for i in idx],
+                                        cfg.beta, pad_id, len(seqs), ref_ctx)
         # Backpropagation: compute d(loss)/d(parameter) for every trainable parameter.
         loss.backward()
-        kls.append(kl)
-    return sum(kls) / len(kls), {}
+        # kl is this micro-batch's mean; weight it by its size so the result is the mean over
+        # sequences even when the last micro-batch is smaller.
+        kl_sum += kl * len(idx)
+    return kl_sum / len(seqs), {"pad_frac": padding_fraction(seqs, batches)}
 
 
 def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=None):
@@ -789,20 +833,25 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
 
     Returns:
         (kl, extra): the mean per-token KL over sequences (logged like GRPO's), and the TB
-        metrics {"tb_loss", "logZ_mean", "logratio_per_token"}.
+        metrics {"tb_loss", "logZ_mean", "logratio_per_token", "pad_frac"}.
     """
-    mb, K = cfg.micro_batch, cfg.group_size
-    st = {"ref_sum": [], "lp_sum": [], "ntok": [], "kl": []}
-    for i in range(0, len(seqs), mb):
-        part = tb_seq_stats(model, seqs[i:i + mb], pad_id, ref_ctx)
+    K = cfg.group_size
+    batches = microbatch_indices(seqs, cfg.micro_batch, cfg.sort_by_length)
+    # Per-sequence statistics, stored at each sequence's ORIGINAL position (micro-batches may
+    # visit sequences in length order, but groups are defined by position: K per prompt).
+    st = {k: [0.0] * len(seqs) for k in ("ref_sum", "lp_sum", "ntok", "kl")}
+    for idx in batches:
+        part = tb_seq_stats(model, [seqs[i] for i in idx], pad_id, ref_ctx)
         for k in st:
-            st[k] += part[k]                         # append this micro-batch's values
+            for i, v in zip(idx, part[k]):
+                st[k][i] = v
     deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau, cfg.length_norm)
     centers = group_centers(deltas, K)
     tb_loss = 0.0
-    for i in range(0, len(seqs), mb):
-        loss = tb_microbatch_loss(model, seqs[i:i + mb], st["ref_sum"][i:i + mb],
-                                  st["ntok"][i:i + mb], rewards[i:i + mb], centers[i:i + mb],
+    pick = lambda xs, idx: [xs[i] for i in idx]      # the values of one micro-batch
+    for idx in batches:
+        loss = tb_microbatch_loss(model, pick(seqs, idx), pick(st["ref_sum"], idx),
+                                  pick(st["ntok"], idx), pick(rewards, idx), pick(centers, idx),
                                   cfg.tau, cfg.length_norm, pad_id, len(seqs))
         loss.backward()                              # accumulate gradients, as for GRPO
         tb_loss += loss.item()
@@ -811,7 +860,8 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
     # centers[::K] = every K-th entry = one center per prompt (the slice [::k] takes every k-th
     # element). log Z_hat = -center, averaged over prompts.
     extra = {"tb_loss": tb_loss, "logZ_mean": -sum(centers[::K]) / (len(centers) // K),
-             "logratio_per_token": sum(lr_tok) / len(lr_tok)}
+             "logratio_per_token": sum(lr_tok) / len(lr_tok),
+             "pad_frac": padding_fraction(seqs, batches)}
     return sum(st["kl"]) / len(st["kl"]), extra
 
 

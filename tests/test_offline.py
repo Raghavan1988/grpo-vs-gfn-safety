@@ -692,6 +692,61 @@ def test_save_every_zero_saves_only_the_final_step(tok):
         assert saved == want
 
 
+def test_length_sorted_microbatches_same_gradient_less_padding(tok):
+    """Micro-batching by length is a pure cost optimisation: for GRPO and for TB the accumulated
+    gradient and the logged metrics equal those of sampling-order batching (up to float
+    rounding), while the model processes far fewer padded positions."""
+    rng = random.Random(0)
+    # 4 prompts x 4 replies with very uneven reply lengths, like refusals next to long answers.
+    seqs = []
+    for g in range(4):
+        prompt = [rng.randrange(10, 500) for _ in range(rng.randrange(3, 9))]
+        seqs += [(prompt, [rng.randrange(10, 500) for _ in range(rng.choice([2, 3, 40, 60]))])
+                 for _ in range(4)]
+    rewards_ = [rng.random() for _ in seqs]
+    adv, _ = rl.group_advantages(rewards_, 4)
+
+    # Pure helper: the docstring's example, the stable order, and the padding saved here.
+    toy = [([0] * 5, [0] * n) for n in (5, 495, 7, 475)]
+    assert rl.microbatch_indices(toy, 2, True) == [[0, 2], [3, 1]]
+    assert rl.microbatch_indices(toy, 2, False) == [[0, 1], [2, 3]]
+    assert rl.microbatch_indices([([1], [2])] * 5, 2, True) == [[0, 1], [2, 3], [4]]   # ties: stable
+    assert abs(rl.padding_fraction(toy, [[0, 1], [2, 3]]) - (1 - 1002 / 1960)) < 1e-12
+    pad_sorted = rl.padding_fraction(seqs, rl.microbatch_indices(seqs, 3, True))
+    pad_plain = rl.padding_fraction(seqs, rl.microbatch_indices(seqs, 3, False))
+    assert pad_sorted < 0.5 * pad_plain, (pad_sorted, pad_plain)
+
+    def grads(method, sort):
+        """Accumulated LoRA gradient and logged metrics of one step, on a policy that has
+        already moved away from the reference (so KL and the TB log-ratio are non-trivial)."""
+        m = tiny_policy(tok, seed=1)
+        torch.manual_seed(2)
+        with torch.no_grad():
+            for n, p in m.named_parameters():
+                if "lora_B" in n:
+                    p.normal_(0, 0.05)
+        # micro_batch 3 does not divide the group size 4, so micro-batches split groups and the
+        # last one is smaller: the hard case for keeping per-sequence values aligned.
+        cfg = rl.GRPOConfig(method=method, tau=0.5, beta=0.1, group_size=4, micro_batch=3,
+                            sort_by_length=sort)
+        if method == "grpo":
+            kl, extra = rl.accumulate_grpo_grads(m, seqs, adv, cfg, 0)
+        else:
+            kl, extra = rl.accumulate_tb_grads(m, seqs, rewards_, cfg, 0)
+        g = {n: p.grad.clone() for n, p in m.named_parameters() if p.requires_grad}
+        return g, kl, extra
+
+    for method in ("grpo", "tb"):
+        (g1, kl1, e1), (g0, kl0, e0) = grads(method, True), grads(method, False)
+        scale = max(v.abs().max().item() for v in g0.values())
+        assert scale > 0
+        assert all(torch.allclose(g1[n], g0[n], atol=1e-4 * scale, rtol=1e-3) for n in g0), method
+        assert kl0 > 0 and math.isclose(kl1, kl0, rel_tol=1e-4)
+        assert e1.pop("pad_frac") == pad_sorted and e0.pop("pad_frac") == pad_plain
+        assert e1.keys() == e0.keys()
+        assert all(math.isclose(e1[k], e0[k], rel_tol=1e-4, abs_tol=1e-5) for k in e0), (e1, e0)
+
+
 def test_tb_microbatched_gradient_matches_textbook_loss(tok):
     """Two-pass micro-batched TB (detached group mean) has the same gradient as the direct
     within-group-variance loss with log Z_hat = -mean(delta) computed with autograd.
