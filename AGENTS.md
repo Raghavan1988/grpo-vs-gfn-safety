@@ -165,6 +165,7 @@ baseline/     modal_baseline.py — evaluation (untuned model or --adapter <run>
 train/        modal_train.py — LoRA training on Modal (grpo | sft | sft+grpo)
 data/         build_splits.py + SPLITS.md (counts and hashes only; prompts are not committed)
 tests/        test_offline.py — CPU tests; also run in the Modal image (--tests-only)
+              test_scoring.py — scorer + diversity-metric tests (no torch needed)
 results/      recorded results (metrics only)
 docs/         literature review
 outputs/      gitignored: generations, prompt files, training logs

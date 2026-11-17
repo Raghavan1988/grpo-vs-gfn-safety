@@ -99,6 +99,8 @@ image = (
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "TOKENIZERS_PARALLELISM": "false"})
     .add_local_dir(ROOT / "gvg", "/root/gvg")
     .add_local_dir(ROOT / "tests", "/root/tests")
+    # analysis/ holds the diversity metrics, which tests/test_scoring.py also covers.
+    .add_local_dir(ROOT / "analysis", "/root/analysis")
 )
 # A Secret holds credentials stored in Modal (here a Hugging Face access token, needed to
 # download models).  It appears inside the container as environment variables.
@@ -158,7 +160,7 @@ class WildGuardJudge:
 def run_tests() -> str:
     """Offline tests inside the exact training image (CPU only).
 
-    Runs tests/test_offline.py inside the same container image as training, which catches
+    Runs everything under tests/ inside the same container image as training, which catches
     package-version problems before paying for an H100.  Triggered by ``--tests-only``.
 
     Returns:
@@ -170,7 +172,7 @@ def run_tests() -> str:
     # "-W ignore" = hide warnings.  The env dict replaces the environment: CUDA_VISIBLE_DEVICES=""
     # hides any GPU so the tests use the CPU; HF_HOME points at the model cache; PYTHONPATH lets
     # the tests import gvg from /root.
-    r = subprocess.run([sys.executable, "-m", "pytest", "/root/tests/test_offline.py", "-q",
+    r = subprocess.run([sys.executable, "-m", "pytest", "/root/tests", "-q",
                         "-p", "no:cacheprovider", "-W", "ignore"], cwd="/root",
                        capture_output=True, text=True, env={"CUDA_VISIBLE_DEVICES": "", "PATH": "/usr/bin:/bin",
                                                             "HF_HOME": HF, "PYTHONPATH": "/root"})
