@@ -232,15 +232,19 @@ def prompt_text(tokenizer, item: dict) -> str:
     """
     # Extra keyword arguments for the template: switch off Qwen3's "thinking" mode.
     kw = {"enable_thinking": False}
+
+    def template(**extra):
+        """Wrap the message in the model's special role markers.
+
+        add_generation_prompt=True appends the "assistant turn starts here" marker; **extra
+        unpacks a dict into keyword arguments, i.e. enable_thinking=False.
+        """
+        return tokenizer.apply_chat_template([{"role": "user", "content": item["prompt"]}],
+                                             tokenize=False, add_generation_prompt=True, **extra)
     try:
-        # The chat template wraps the message in the model's special role markers.
-        # add_generation_prompt=True appends the "assistant turn starts here" marker.
-        # **kw unpacks the dict into keyword arguments, i.e. enable_thinking=False.
-        p = tokenizer.apply_chat_template([{"role": "user", "content": item["prompt"]}],
-                                          tokenize=False, add_generation_prompt=True, **kw)
+        p = template(**kw)
     except TypeError:  # tokenizers without the enable_thinking switch (tests)
-        p = tokenizer.apply_chat_template([{"role": "user", "content": item["prompt"]}],
-                                          tokenize=False, add_generation_prompt=True)
+        p = template()
     # item.get("prefill", "") returns "" when the item has no prefill, so plain prompts are
     # unchanged.
     return p + item.get("prefill", "")
@@ -378,6 +382,69 @@ def token_logprobs(model, ids, att):
     return lp
 
 
+def pad_token_id(tokenizer) -> int:
+    """Token ID used to pad batches.
+
+    Some tokenizers have no padding token; fall back to end-of-sequence. Padding is masked out
+    of every loss, so which ID is used does not matter.
+    """
+    return tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+
+def _batch_tensors(model, seqs, pad_id):
+    """Pad a micro-batch and move it to the model's device.
+
+    Returns:
+        ids (B, L), att (B, L): as in _pad_batch.
+        mask (B, L-1): the completion mask shifted like the targets, so mask[:, t] says whether
+            token t+1 is a reply token. It lines up with token_logprobs' (B, L-1) output; prompt,
+            prefill and padding positions are 0.
+        dev: the device (CPU or which GPU) the model lives on; all tensors must share it.
+    """
+    # next(iter) takes the first parameter just to read its device.
+    dev = next(model.parameters()).device
+    # A generator expression unpacked into three names.
+    ids, att, cm = (t.to(dev) for t in _pad_batch(seqs, pad_id))
+    return ids, att, cm[:, 1:], dev
+
+
+def reference_logprobs(model, ids, att, ref_ctx=None):
+    """Per-token log pi_ref (B, L-1), computed without gradients.
+
+    ref_ctx() returns a context manager under which the model IS the reference policy (see
+    adapter_ref_ctx). Default: model.disable_adapter(), a PEFT context manager that temporarily
+    switches LoRA off, giving the original untuned model.
+    """
+    import torch
+    ctx = ref_ctx() if ref_ctx is not None else model.disable_adapter()
+    # torch.no_grad(): do not record operations for backpropagation (the reference is a fixed
+    # target, we never train it), which also saves a lot of memory. Both context managers are
+    # entered together, and both are undone when the block ends, even on error.
+    with torch.no_grad(), ctx:
+        return token_logprobs(model, ids, att)
+
+
+def k3_kl(ref, lp):
+    """Per-token KL(pi || pi_ref) estimate from log pi_ref and log pi of the sampled tokens.
+
+    The "k3" estimator: with d = log pi_ref - log pi, k3 = exp(d) - d - 1. It is always >= 0
+    (since e^d >= 1 + d), equals 0 when pi = pi_ref, and its average over tokens sampled from
+    pi is an unbiased estimate of the KL divergence.
+    """
+    import torch
+    d = ref - lp
+    return torch.exp(d) - d - 1.0
+
+
+def full_reply(tokenizer, item: dict, completion_ids: list[int]) -> str:
+    """The reply as the user (and the judge) would see it: prefill + generated continuation.
+
+    The prefill is part of the PROMPT ids, so it is not among the generated tokens and has to be
+    put back in front of the decoded text.
+    """
+    return item.get("prefill", "") + _decode(tokenizer, completion_ids)
+
+
 def grpo_microbatch_loss(model, seqs, adv, beta, pad_id, n_total, ref_ctx=None):
     """Loss for one micro-batch, already scaled by len(seqs)/n_total (for accumulation).
 
@@ -400,23 +467,8 @@ def grpo_microbatch_loss(model, seqs, adv, beta, pad_id, n_total, ref_ctx=None):
         this micro-batch as a plain float (for logging only).
     """
     import torch
-    # The device (CPU or which GPU) the model lives on; all tensors must be on the same one.
-    # next(iter) takes the first parameter just to read its device.
-    dev = next(model.parameters()).device
-    # Build the padded tensors and move each to the device (a generator expression unpacked into
-    # three names).
-    ids, att, cm = (t.to(dev) for t in _pad_batch(seqs, pad_id))
-    # Shift the completion mask like the targets: mask[:, t] says whether token t+1 is a reply
-    # token, matching the (B, L-1) layout of token_logprobs. So prompt/prefill/padding get 0.
-    mask = cm[:, 1:]
-    # Choose how to get the reference model. Default: model.disable_adapter() is a PEFT context
-    # manager that temporarily switches LoRA off, giving the original untuned model.
-    ctx = ref_ctx() if ref_ctx is not None else model.disable_adapter()
-    # torch.no_grad(): do not record operations for backpropagation (the reference is a fixed
-    # target, we never train it), which also saves a lot of memory. Both context managers are
-    # entered together, and both are undone when the block ends, even on error.
-    with torch.no_grad(), ctx:
-        ref = token_logprobs(model, ids, att)               # (B, L-1) log pi_ref per token
+    ids, att, mask, dev = _batch_tensors(model, seqs, pad_id)
+    ref = reference_logprobs(model, ids, att, ref_ctx)      # (B, L-1) log pi_ref per token
     # Policy pass, WITH gradient tracking (LoRA is active again here).
     lp = token_logprobs(model, ids, att)                    # (B, L-1) log pi per token
     # Advantages as a (B, 1) column so it broadcasts over every token of its sequence.
@@ -428,11 +480,8 @@ def grpo_microbatch_loss(model, seqs, adv, beta, pad_id, n_total, ref_ctx=None):
     # is 1). Minimising this raises log p of replies with A > 0 and lowers it when A < 0: the
     # REINFORCE update. (It is the PPO ratio pi/pi_old, which equals 1 with one update per batch.)
     pg = -a * torch.exp(lp - lp.detach())
-    # KL penalty per token with the "k3" estimator: with d = log pi_ref - log pi,
-    # k3 = exp(d) - d - 1. It is always >= 0 (since e^d >= 1 + d), equals 0 when pi = pi_ref, and
-    # its average over sampled tokens is an unbiased estimate of KL(pi || pi_ref).
-    d = ref - lp
-    kl = torch.exp(d) - d - 1.0                       # k3 estimator, >= 0
+    # KL penalty per token (see k3_kl), >= 0.
+    kl = k3_kl(ref, lp)
     # Per-token loss: reward-driven term plus beta times the "don't drift too far" term.
     tok = pg + beta * kl
     # Number of reply tokens per sequence, (B,). clamp(min=1) avoids dividing by 0 for an
@@ -462,18 +511,13 @@ def tb_seq_stats(model, seqs, pad_id, ref_ctx=None) -> dict:
         "ntok" = number of reply tokens, "kl" = average per-token k3 KL estimate.
     """
     import torch
-    dev = next(model.parameters()).device
-    ids, att, cm = (t.to(dev) for t in _pad_batch(seqs, pad_id))
-    mask = cm[:, 1:]                       # reply-token mask aligned with the shifted logprobs
-    ctx = ref_ctx() if ref_ctx is not None else model.disable_adapter()
+    ids, att, mask, _ = _batch_tensors(model, seqs, pad_id)
+    ref = reference_logprobs(model, ids, att, ref_ctx)   # reference (adapter off / frozen copy)
     # Neither pass needs gradients here; the gradient pass is tb_microbatch_loss.
     with torch.no_grad():
-        with ctx:
-            ref = token_logprobs(model, ids, att)    # reference model (adapter off / frozen copy)
-        lp = token_logprobs(model, ids, att)         # current policy (trainable adapter on)
+        lp = token_logprobs(model, ids, att)             # current policy (trainable adapter on)
     ntok = mask.sum(1).clamp(min=1.0)
-    d = ref - lp
-    k3 = ((torch.exp(d) - d - 1.0) * mask).sum(1) / ntok    # per-sequence mean k3 KL, logging only
+    k3 = (k3_kl(ref, lp) * mask).sum(1) / ntok           # per-sequence mean k3 KL, logging only
     # (x * mask).sum(1) adds up the per-token logprobs over reply tokens only: the log of the
     # probability of the whole reply (log of a product = sum of logs). .tolist() -> Python list.
     return {"ref_sum": (ref * mask).sum(1).tolist(), "lp_sum": (lp * mask).sum(1).tolist(),
@@ -528,9 +572,7 @@ def tb_microbatch_loss(model, seqs, ref_sum, ntok, rewards, centers, tau, length
         scalar loss tensor (sum over this micro-batch / n_total) to call .backward() on.
     """
     import torch
-    dev = next(model.parameters()).device
-    ids, att, cm = (t.to(dev) for t in _pad_batch(seqs, pad_id))
-    mask = cm[:, 1:]
+    ids, att, mask, dev = _batch_tensors(model, seqs, pad_id)
     lp = token_logprobs(model, ids, att)       # (B, L-1), with gradients this time
     lp_sum = (lp * mask).sum(1)                # (B,) log pi(reply | prompt)
     # A lambda is a one-line unnamed function: t(xs) turns a Python list into a float tensor
@@ -559,9 +601,7 @@ def sft_microbatch_loss(model, seqs, pad_id, n_total):
     Returns:
         scalar loss tensor (sum of per-sequence mean NLL / n_total).
     """
-    dev = next(model.parameters()).device
-    ids, att, cm = (t.to(dev) for t in _pad_batch(seqs, pad_id))
-    mask = cm[:, 1:]                                 # reply tokens only, aligned with logprobs
+    ids, att, mask, _ = _batch_tensors(model, seqs, pad_id)   # mask: reply tokens only
     lp = token_logprobs(model, ids, att)             # (B, L-1)
     # Per sequence: minus the average logprob over reply tokens -> (B,).
     seq_nll = -(lp * mask).sum(1) / mask.sum(1).clamp(min=1.0)
@@ -675,7 +715,7 @@ def evaluate(tokenizer, items, generate_fn, judge_fn, step, max_new_tokens) -> d
     # Put the prefill back in front of the generated text so the judge sees the whole reply
     # (the prefill was part of the prompt, so it is not in the generated tokens). c[0] = the
     # only sample.
-    replies = [x.get("prefill", "") + _decode(tokenizer, c[0]) for x, c in zip(items, comps)]
+    replies = [full_reply(tokenizer, x, c[0]) for x, c in zip(items, comps)]
     rs = compute_rewards(items, replies, judge_fn)
     return {f"val_{k}": v for k, v in _summarise(items, rs).items()}
 
@@ -717,6 +757,64 @@ def adapter_ref_ctx(model, ref_name: str = "ref", active: str = "default"):
     return ctx
 
 
+def accumulate_grpo_grads(model, seqs, adv, cfg: GRPOConfig, pad_id, ref_ctx=None):
+    """Backpropagate the GRPO loss of one training step, micro-batch by micro-batch.
+
+    Gradient accumulation: 128 sequences do not fit on the GPU at once, so they are processed
+    cfg.micro_batch at a time. Each loss.backward() ADDS its gradients into each parameter's
+    .grad, and because every loss is divided by len(seqs), the total equals the gradient of the
+    full-batch mean. The caller clears the gradients before and steps the optimizer after.
+
+    Returns:
+        (kl, extra): the mean of the micro-batches' per-token KL (logged), and an empty dict
+        (GRPO has no method-specific metrics; TB does, see accumulate_tb_grads).
+    """
+    mb, kls = cfg.micro_batch, []
+    for i in range(0, len(seqs), mb):
+        loss, kl = grpo_microbatch_loss(model, seqs[i:i + mb], adv[i:i + mb], cfg.beta, pad_id,
+                                        len(seqs), ref_ctx)
+        # Backpropagation: compute d(loss)/d(parameter) for every trainable parameter.
+        loss.backward()
+        kls.append(kl)
+    return sum(kls) / len(kls), {}
+
+
+def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=None):
+    """Backpropagate the trajectory-balance loss of one training step (two passes).
+
+    Pass 1 (no gradients) collects per-sequence summed logprobs and lengths for all sequences,
+    giving every TB residual delta and each group's mean (= -log Z_hat per prompt). Pass 2 (with
+    gradients) treats those group means as fixed numbers, so it no longer matters that a group
+    of 8 might be split across two micro-batches of 4.
+
+    Returns:
+        (kl, extra): the mean per-token KL over sequences (logged like GRPO's), and the TB
+        metrics {"tb_loss", "logZ_mean", "logratio_per_token"}.
+    """
+    mb, K = cfg.micro_batch, cfg.group_size
+    st = {"ref_sum": [], "lp_sum": [], "ntok": [], "kl": []}
+    for i in range(0, len(seqs), mb):
+        part = tb_seq_stats(model, seqs[i:i + mb], pad_id, ref_ctx)
+        for k in st:
+            st[k] += part[k]                         # append this micro-batch's values
+    deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau, cfg.length_norm)
+    centers = group_centers(deltas, K)
+    tb_loss = 0.0
+    for i in range(0, len(seqs), mb):
+        loss = tb_microbatch_loss(model, seqs[i:i + mb], st["ref_sum"][i:i + mb],
+                                  st["ntok"][i:i + mb], rewards[i:i + mb], centers[i:i + mb],
+                                  cfg.tau, cfg.length_norm, pad_id, len(seqs))
+        loss.backward()                              # accumulate gradients, as for GRPO
+        tb_loss += loss.item()
+    # Log-ratio log pi - log pi_ref per reply token, for monitoring drift.
+    lr_tok = [(l - f) / n for l, f, n in zip(st["lp_sum"], st["ref_sum"], st["ntok"])]
+    # centers[::K] = every K-th entry = one center per prompt (the slice [::k] takes every k-th
+    # element). log Z_hat = -center, averaged over prompts.
+    extra = {"tb_loss": tb_loss, "logZ_mean": -sum(centers[::K]) / (len(centers) // K),
+             "logratio_per_token": sum(lr_tok) / len(lr_tok)}
+    return sum(st["kl"]) / len(st["kl"]), extra
+
+
 def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, generate_fn, judge_fn,
                log_fn=print, save_fn=None, ref_ctx=None, start_step: int = 0,
                opt_state: dict | None = None) -> list[dict]:
@@ -753,9 +851,7 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
     # vLLM and WildGuard, while tests supply tiny local stand-ins.
     import torch
     torch.manual_seed(cfg.seed)              # reproducible random numbers in PyTorch
-    # Some tokenizers have no padding token; fall back to end-of-sequence. Padding is masked out
-    # anyway, so which ID we use does not matter.
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    pad_id = pad_token_id(tokenizer)
     # Trainable parameters only: with LoRA these are the small adapter matrices; the 8B base
     # weights have requires_grad=False and stay frozen.
     params = [p for p in model.parameters() if p.requires_grad]
@@ -790,61 +886,24 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         seqs = [(p, c) for p, cs in zip(pids, comps) for c in cs]
         # ---- 2. score the replies ----
         # Text for the judge: prefill + generated continuation (the full assistant reply).
-        replies = [x.get("prefill", "") + _decode(tokenizer, c) for x, (_, c) in zip(items, seqs)]
+        replies = [full_reply(tokenizer, x, c) for x, (_, c) in zip(items, seqs)]
         rs = compute_rewards(items, replies, judge_fn)
         # Group-normalised advantages (used by GRPO; for TB only zero_frac is logged).
-        adv, zero_frac = group_advantages([r["reward"] for r in rs], cfg.group_size, cfg.adv_eps,
-                                          cfg.adv_min_std)
+        adv, zero_frac = group_advantages([r["reward"] for r in rs], cfg.group_size,
+                                          cfg.adv_eps, cfg.adv_min_std)
         t_judge = time.time() - t0 - t_gen
 
         # ---- 3. compute the loss and accumulate gradients ----
         model.train()                        # training mode (e.g. enables dropout if any)
         # Clear gradients left over from the previous step (set_to_none frees their memory).
         opt.zero_grad(set_to_none=True)
-        kls, extra = [], {}
-        mb = cfg.micro_batch
+        # Gradients of all 128 sequences are accumulated into each parameter's .grad; the
+        # optimizer then takes ONE step below.
+        rewards = [r["reward"] for r in rs]
         if cfg.method == "grpo":
-            # Gradient accumulation: 128 sequences do not fit on the GPU at once, so we process
-            # them mb at a time. Each loss.backward() ADDS its gradients into each parameter's
-            # .grad, and because every loss is divided by len(seqs), the total equals the
-            # gradient of the full-batch mean. The optimizer then takes ONE step below.
-            for i in range(0, len(seqs), mb):
-                loss, kl = grpo_microbatch_loss(model, seqs[i:i + mb], adv[i:i + mb], cfg.beta,
-                                                pad_id, len(seqs), ref_ctx)
-                # Backpropagation: compute d(loss)/d(parameter) for every trainable parameter.
-                loss.backward()
-                kls.append(kl)
+            kl, extra = accumulate_grpo_grads(model, seqs, adv, cfg, pad_id, ref_ctx)
         else:  # trajectory balance
-            # Pass 1 (no gradients): collect per-sequence summed logprobs and lengths for all
-            # 128 sequences, micro-batch by micro-batch.
-            st = {"ref_sum": [], "lp_sum": [], "ntok": [], "kl": []}
-            for i in range(0, len(seqs), mb):
-                part = tb_seq_stats(model, seqs[i:i + mb], pad_id, ref_ctx)
-                for k in st:
-                    st[k] += part[k]                 # append this micro-batch's values
-            rewards = [r["reward"] for r in rs]
-            # TB residual of every sequence, then each group's mean (= -log Z_hat per prompt).
-            deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau,
-                               cfg.length_norm)
-            centers = group_centers(deltas, cfg.group_size)
-            tb_loss = 0.0
-            # Pass 2 (with gradients): the group means are now fixed numbers, so it no longer
-            # matters that a group of 8 might be split across two micro-batches of 4.
-            for i in range(0, len(seqs), mb):
-                loss = tb_microbatch_loss(model, seqs[i:i + mb], st["ref_sum"][i:i + mb],
-                                          st["ntok"][i:i + mb], rewards[i:i + mb],
-                                          centers[i:i + mb], cfg.tau, cfg.length_norm, pad_id,
-                                          len(seqs))
-                loss.backward()                      # accumulate gradients, as for GRPO
-                tb_loss += loss.item()
-            kls = [sum(st["kl"]) / len(st["kl"])]    # mean KL, logged like GRPO's
-            # Log-ratio log pi - log pi_ref per reply token, for monitoring drift.
-            lr_tok = [(l - f) / n for l, f, n in zip(st["lp_sum"], st["ref_sum"], st["ntok"])]
-            # centers[::cfg.group_size] = every 8th entry = one center per prompt (the slice
-            # [::k] takes every k-th element). log Z_hat = -center, averaged over prompts.
-            extra = {"tb_loss": tb_loss,
-                     "logZ_mean": -sum(centers[::cfg.group_size]) / (len(centers) // cfg.group_size),
-                     "logratio_per_token": sum(lr_tok) / len(lr_tok)}
+            kl, extra = accumulate_tb_grads(model, seqs, rewards, cfg, pad_id, ref_ctx)
         # ---- 4. update the LoRA weights ----
         # If the overall gradient length (norm) exceeds grad_clip, scale it down to grad_clip
         # so one unusual batch cannot make a huge, destabilising step. Returns the norm BEFORE
@@ -854,9 +913,9 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
 
         # ---- 5. log ----
         # `**d` inside a dict literal merges all of d's entries into the new dict.
-        rec = {"step": step, "reward_mean": sum(r["reward"] for r in rs) / len(rs),
+        rec = {"step": step, "reward_mean": sum(rewards) / len(rewards),
                **_summarise(items, rs), "zero_var_group_frac": zero_frac,
-               "kl": sum(kls) / len(kls), "grad_norm": gnorm, **extra,
+               "kl": kl, "grad_norm": gnorm, **extra,
                # average reply length in tokens, and fraction cut off at max_new_tokens
                "resp_len": sum(len(c) for _, c in seqs) / len(seqs),
                "truncated_frac": sum(len(c) >= cfg.max_new_tokens for _, c in seqs) / len(seqs),
@@ -897,7 +956,7 @@ def build_sft_set(tokenizer, items, cfg: SFTConfig, generate_fn, judge_fn, log_f
     # Flatten so candidate k of prompt j sits at index j * K + k.
     flat_items = [x for x in items for _ in range(cfg.samples_per_prompt)]
     flat = [c for cs in comps for c in cs]
-    replies = [x.get("prefill", "") + _decode(tokenizer, c) for x, c in zip(flat_items, flat)]
+    replies = [full_reply(tokenizer, x, c) for x, c in zip(flat_items, flat)]
     rs = compute_rewards(flat_items, replies, judge_fn)
     # keep: chosen examples; stats/why: counters for logging; trunc_kept: kept-but-truncated.
     keep, stats, why, trunc_kept = [], {}, {}, 0
@@ -944,7 +1003,7 @@ def train_sft(model, tokenizer, examples, cfg: SFTConfig, log_fn=print) -> list[
     """
     import torch
     torch.manual_seed(cfg.seed)
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    pad_id = pad_token_id(tokenizer)
     params = [p for p in model.parameters() if p.requires_grad]    # LoRA weights only
     opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=0.0)
     rng = random.Random(cfg.seed)
