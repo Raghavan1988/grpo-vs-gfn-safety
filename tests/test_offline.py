@@ -616,6 +616,48 @@ def test_tb_config_validation():
             rl.GRPOConfig(**bad)
 
 
+def test_config_validation_rejects_settings_that_cannot_train():
+    """Settings that would crash, or silently train nothing, are rejected when the config is
+    built (on the laptop, for free) instead of after a paid sampling and judging round."""
+    bad_grpo = [dict(steps=0), dict(group_size=1), dict(mix={}), dict(mix={"math": 0}),
+                dict(mix={"math": -1}), dict(mix={"math": 1.5}), dict(mix={"maths": 2}),
+                dict(temperature=0.0), dict(lr=0.0), dict(beta=-0.1), dict(grad_clip=0.0),
+                dict(micro_batch=0), dict(max_new_tokens=0), dict(val_every=-1),
+                dict(save_every=-1), dict(adv_eps=0.0), dict(adv_min_std=-0.1)]
+    for kw in bad_grpo:
+        with pytest.raises(ValueError):
+            rl.GRPOConfig(**kw)
+    bad_sft = [dict(samples_per_prompt=0), dict(keep_threshold=1.5), dict(keep_threshold=-0.1),
+               dict(epochs=0), dict(batch_size=0), dict(micro_batch=0), dict(lr=0.0),
+               dict(temperature=-1.0), dict(temperature=0.0), dict(grad_clip=0.0),
+               dict(max_new_tokens=0)]
+    for kw in bad_sft:
+        with pytest.raises(ValueError):
+            rl.SFTConfig(**kw)
+    # Legitimate edge settings still work: a pool with zero prompts, no validation, beta 0,
+    # greedy SFT with a single candidate, and a config rebuilt from its own dict (as Modal does).
+    rl.GRPOConfig(mix={"harmful": 0, "math": 2}, val_every=0, save_every=0, beta=0.0)
+    rl.SFTConfig(samples_per_prompt=1, temperature=0.0)
+    assert rl.GRPOConfig(**rl.config_dict(rl.GRPOConfig())) == rl.GRPOConfig()
+    assert rl.SFTConfig(**rl.config_dict(rl.SFTConfig())) == rl.SFTConfig()
+
+
+def test_save_every_zero_saves_only_the_final_step(tok):
+    """save_every=0 used to divide by zero at the end of step 1, i.e. after the first paid
+    sampling round. It now means "save at the final step only", mirroring val_every=0."""
+    eos = tok.convert_tokens_to_ids("<|im_end|>")
+    good = tok("#### 4", add_special_tokens=False)["input_ids"] + [eos]
+    bad = tok("#### 7", add_special_tokens=False)["input_ids"] + [eos]
+    items = [{"kind": "math", "prompt": f"2+2? ({i})", "answer": "4", "prefill": ""} for i in range(2)]
+    for save_every, want in ((0, [3]), (2, [2, 3])):
+        cfg = rl.GRPOConfig(steps=3, group_size=2, mix={"math": 1}, val_every=0,
+                            save_every=save_every, max_new_tokens=16)
+        saved = []
+        rl.train_grpo(tiny_policy(tok), tok, items, [], cfg, _fixed_generate(tok, good, bad),
+                      lambda p: [], log_fn=lambda s: None, save_fn=lambda step, opt: saved.append(step))
+        assert saved == want
+
+
 def test_tb_microbatched_gradient_matches_textbook_loss(tok):
     """Two-pass micro-batched TB (detached group mean) has the same gradient as the direct
     within-group-variance loss with log Z_hat = -mean(delta) computed with autograd.

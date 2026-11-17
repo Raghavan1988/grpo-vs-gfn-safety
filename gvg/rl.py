@@ -80,6 +80,11 @@ from dataclasses import asdict, dataclass, field
 from gvg.rewards import compute_rewards
 
 
+# Sampling pools a training mix may name (see pool_key): the three prompt kinds, plus
+# "harmful_prefill" for harmful prompts that carry a prefill attack.
+POOLS = ("harmful_prefill", "harmful", "benign", "math")
+
+
 # ----------------------------------------------------------------------------------- config
 # @dataclass turns the class below into a simple "bag of settings". Each line `name: type = value`
 # declares one setting with its default; Python generates GRPOConfig(steps=..., lr=...) for us, so
@@ -117,7 +122,7 @@ class GRPOConfig:
     grad_clip: float = 1.0                   # max total gradient norm (see clip_grad_norm_)
     seed: int = 0                            # makes prompt order and init reproducible
     val_every: int = 10                      # greedy validation every N steps (0 = off)
-    save_every: int = 10                     # save the adapter every N steps
+    save_every: int = 10                     # save the adapter every N steps (0 = final step only)
     method: str = "grpo"                     # "grpo" | "tb" (trajectory balance / GFlowNet)
     tau: float = 0.1                         # TB reward temperature: target pi_ref * exp(r / tau)
                                              # small tau = sharp preference for high reward;
@@ -138,6 +143,38 @@ class GRPOConfig:
             raise ValueError(f"ref must be 'base' or 'init', not {self.ref!r}")
         if self.tau <= 0:
             raise ValueError("tau must be positive")
+        # The checks below catch settings that would otherwise fail (or silently do nothing)
+        # only after a paid sampling + judging round.
+        if self.steps < 1:
+            raise ValueError("steps must be at least 1")
+        if self.group_size < 2:
+            # With one reply per prompt there is nothing to compare within a group: every GRPO
+            # advantage is 0 and every TB residual equals its own group mean, so nothing trains.
+            raise ValueError("group_size must be at least 2 (both losses compare replies within a group)")
+        if not self.mix or any(not isinstance(n, int) or isinstance(n, bool) or n < 0
+                               for n in self.mix.values()) or sum(self.mix.values()) == 0:
+            raise ValueError(f"mix must map pools to non-negative prompt counts with at least one "
+                             f"prompt per step, not {self.mix!r}")
+        unknown = set(self.mix) - set(POOLS)
+        if unknown:
+            raise ValueError(f"unknown pools in mix: {sorted(unknown)} (allowed: {list(POOLS)})")
+        if self.temperature <= 0:
+            # Temperature 0 is greedy decoding: all replies in a group would be identical.
+            raise ValueError("temperature must be positive (training samples must differ within a group)")
+        if self.lr <= 0:
+            raise ValueError("lr must be positive")
+        if self.beta < 0:
+            raise ValueError("beta must not be negative")
+        if self.adv_eps <= 0 or self.adv_min_std < 0:
+            raise ValueError("adv_eps must be positive and adv_min_std must not be negative")
+        if self.grad_clip <= 0:
+            raise ValueError("grad_clip must be positive")
+        for name in ("max_new_tokens", "micro_batch"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be at least 1")
+        for name in ("val_every", "save_every"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must not be negative (0 switches it off)")
 
 
 @dataclass
@@ -159,6 +196,23 @@ class SFTConfig:
     micro_batch: int = 4                     # examples per forward/backward pass (GPU memory)
     grad_clip: float = 1.0                   # max total gradient norm
     seed: int = 0                            # controls the shuffle order
+
+    def __post_init__(self):
+        """Validate the settings before any sampling is paid for (see GRPOConfig.__post_init__)."""
+        if not 0.0 <= self.keep_threshold <= 1.0:
+            raise ValueError("keep_threshold must lie in [0, 1], the range of the rewards")
+        if self.temperature < 0:
+            raise ValueError("temperature must not be negative")
+        if self.temperature == 0 and self.samples_per_prompt > 1:
+            raise ValueError("temperature 0 is greedy: all candidates would be identical; "
+                             "use samples_per_prompt=1 or a positive temperature")
+        if self.lr <= 0:
+            raise ValueError("lr must be positive")
+        if self.grad_clip <= 0:
+            raise ValueError("grad_clip must be positive")
+        for name in ("samples_per_prompt", "max_new_tokens", "epochs", "batch_size", "micro_batch"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be at least 1")
 
 
 # ----------------------------------------------------------------------------------- helpers
@@ -814,7 +868,8 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         logs.append(rec)
         log_fn(json.dumps(rec))
         # Save the adapter periodically and always at the final step.
-        if save_fn and (step % cfg.save_every == 0 or step == cfg.steps):
+        # (save_every = 0 means "final step only"; the check also avoids dividing by zero.)
+        if save_fn and ((cfg.save_every and step % cfg.save_every == 0) or step == cfg.steps):
             save_fn(step, opt)
     return logs
 
