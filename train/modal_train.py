@@ -396,7 +396,11 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
         # A different seed stream for reference samples. At step 1 the fresh adapter changes
         # nothing, so with the same seed the "policy" and "reference" samples would be identical
         # copies. Policy seeds are unchanged from earlier runs.
+        # The sampling seed for this call: a different number for every (run seed, step), so each
+        # step draws fresh samples but a rerun with the same run seed repeats them exactly.
         s = seed * 100003 + step
+        # Reference samples count DOWN from the largest 31-bit number instead, so the two seed
+        # streams never meet for any realistic seed and step.
         s = 2 ** 31 - 1 - s if reference else s
         # SamplingParams controls generation:
         #   n            replies per prompt
@@ -551,12 +555,18 @@ def _git_sha() -> str:
     import subprocess  # runs git as a child process
 
     def git(*args):
+        # Run `git <args>` in the repository folder and return what it printed, without the
+        # trailing newline. stderr=DEVNULL hides git's own error messages.
         return subprocess.check_output(["git", *args], text=True, cwd=ROOT,
                                        stderr=subprocess.DEVNULL).strip()
     try:
+        # `git rev-parse HEAD` prints the id (a 40-character hash) of the current commit.
+        # `git status --porcelain` prints one line per changed file and nothing when the tracked
+        # files match that commit; a non-empty answer therefore means "dirty".
         sha = git("rev-parse", "HEAD")
         return sha + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
     except Exception:
+        # git missing, or not a git checkout: record that instead of crashing the launch.
         return "unknown"
 
 
@@ -600,9 +610,11 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
         # .remote() runs run_tests in the cloud and returns its output here.
         print(run_tests.remote())
         return
+    # Checked here on the laptop, before any data is loaded or cloud job started.
     if ref_samples and pipeline != "tb":
         raise SystemExit("--ref-samples is only valid with --pipeline tb")
     tr, va, sha = _load_splits()
+    # The code version launching this run; passed to the cloud job and saved in meta.json.
     git = _git_sha()
     # Month-day-hour-minute, e.g. "1114-0930", to make default run names unique.
     stamp = time.strftime("%m%d-%H%M")
