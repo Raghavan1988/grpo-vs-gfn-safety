@@ -5,6 +5,7 @@
     modal run train/modal_train.py --pipeline sft+grpo             # rejection-sampling SFT, then GRPO
     modal run train/modal_train.py --pipeline sft                  # SFT only
     modal run train/modal_train.py --pipeline tb --tau 0.1         # GFlowNet trajectory balance
+    modal run train/modal_train.py --pipeline tb --tau 0.03 --ref-samples 4   # off-policy TB
 
 Layout: one H100 container holds the policy twice (vLLM for sampling, HF + PEFT for gradients);
 WildGuard (the training judge) runs in its own L40S container and is called per batch.
@@ -186,7 +187,7 @@ def run_tests() -> str:
 @app.function(image=image, gpu="H100", volumes={HF: hf_cache, "/ckpts": ckpts}, secrets=SECRETS,
               timeout=8 * 3600)
 def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dict,
-          init_adapter: str | None = None, data_sha: str = "") -> list[dict]:
+          init_adapter: str | None = None, data_sha: str = "", git_sha: str = "") -> list[dict]:
     """Run one training job (GRPO, trajectory balance or SFT) on an H100 and save the adapter.
 
     This runs in the cloud; ``main`` calls it with ``train.remote(...)``.  It sets up the two
@@ -203,6 +204,8 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
         init_adapter: name of an earlier run whose final LoRA adapter to start from (the SFT
             run in sft+grpo), or None to start from a fresh adapter.
         data_sha: fingerprint (SHA-256 hash) of the training data, recorded in meta.json.
+        git_sha: commit of the code on the laptop that launched the run ("-dirty" if it had
+            uncommitted changes), recorded in meta.json.
 
     Returns:
         The list of per-step log records (dicts), which ``main`` saves on the laptop.
@@ -364,7 +367,14 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
         # LoRARequest(name, unique integer id, folder) tells vLLM which adapter to apply.
         return LoRARequest(f"a{state['id']}", state["id"], str(d))
 
-    def generate_fn(prompt_ids, n, step, temperature, max_new_tokens):
+    # Off-policy TB samples part of each group from the REFERENCE policy. With ref = "base" that
+    # is the untuned model (no adapter at all); with ref = "init" it is the frozen starting
+    # adapter, which never changes, so it gets one fixed id far from the policy's counter.
+    ref_lora = None
+    if mode == "grpo" and cfg.get("ref", "base") == "init":
+        ref_lora = LoRARequest("ref", 10 ** 6, f"/ckpts/{init_adapter}/final")
+
+    def generate_fn(prompt_ids, n, step, temperature, max_new_tokens, reference=False):
         """Sample n replies per prompt with vLLM from the current policy.
 
         Args:
@@ -373,6 +383,7 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
             step: training step, mixed into the random seed so each step draws new samples.
             temperature: randomness of sampling; 0.0 means greedy (always the likeliest token).
             max_new_tokens: cap on reply length in tokens.
+            reference: sample from the reference policy instead (off-policy TB).
 
         Returns:
             A nested list [prompt][sample] -> list of reply token ids.  gvg/rl.py receives this
@@ -380,8 +391,13 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
         """
         # Export the newest adapter so vLLM samples from the current policy rather
         # than from the weights used at the previous optimizer step.
-        req = current_lora()
+        req = ref_lora if reference else current_lora()
         greedy = temperature == 0.0
+        # A different seed stream for reference samples. At step 1 the fresh adapter changes
+        # nothing, so with the same seed the "policy" and "reference" samples would be identical
+        # copies. Policy seeds are unchanged from earlier runs.
+        s = seed * 100003 + step
+        s = 2 ** 31 - 1 - s if reference else s
         # SamplingParams controls generation:
         #   n            replies per prompt
         #   temperature  >1 flatter / more random, <1 sharper, 0 greedy
@@ -393,7 +409,7 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
         #                step, derived from the run seed (100003 is just a large prime)
         #   stop_token_ids  stop as soon as an end-of-turn token is produced
         sp = SamplingParams(n=n, temperature=temperature, top_p=1.0, top_k=-1,
-                            max_tokens=max_new_tokens, seed=None if greedy else seed * 100003 + step,
+                            max_tokens=max_new_tokens, seed=None if greedy else s,
                             stop_token_ids=list(STOP_IDS))
         # TokensPrompt passes token ids directly (no re-tokenising, so vLLM sees exactly the ids
         # the trainer will use).  lora_request applies the adapter just exported; use_tqdm=False
@@ -450,7 +466,8 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
 
     # Metadata describing the run, saved next to the checkpoints for later reference.
     meta = {"run_name": run_name, "mode": mode, "model": GEN_MODEL, "lora": LORA, "cfg": cfg,
-            "init_adapter": init_adapter, "data_sha": data_sha, "n_train": len(train_items),
+            "init_adapter": init_adapter, "data_sha": data_sha, "git_sha": git_sha,
+            "n_train": len(train_items),
             "n_val": len(val_items), "started": time.strftime("%Y-%m-%d %H:%M:%S")}
     # json.dumps turns the dict into JSON text; indent=2 makes it readable.
     if start_step:
@@ -525,6 +542,24 @@ def _load_splits():
     return tr, va, sha
 
 
+def _git_sha() -> str:
+    """HEAD of this repo, suffixed "-dirty" if tracked files have uncommitted changes.
+
+    Recorded in each run's meta.json so a result can be traced to the exact code that produced
+    it (same convention as baseline/modal_baseline.py). Untracked files are ignored.
+    """
+    import subprocess  # runs git as a child process
+
+    def git(*args):
+        return subprocess.check_output(["git", *args], text=True, cwd=ROOT,
+                                       stderr=subprocess.DEVNULL).strip()
+    try:
+        sha = git("rev-parse", "HEAD")
+        return sha + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
+    except Exception:
+        return "unknown"
+
+
 def _save_local(run_name, logs):
     """Write a run's log records to outputs/train/<run_name>/log.jsonl on the laptop."""
     out = ROOT / "outputs" / "train" / run_name
@@ -541,13 +576,15 @@ def _save_local(run_name, logs):
 @app.local_entrypoint()
 def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int = 0,
          sft_epochs: int = 1, tests_only: bool = False, ref: str = "", tau: float = 0.1,
-         length_norm: bool = False, init: str = ""):
+         length_norm: bool = False, init: str = "", ref_samples: int = 0):
     """--pipeline grpo | tb | sft | sft+grpo. Run names default to <pipeline>-s<seed>-<timestamp>.
     --ref base | init: KL reference for GRPO. Default: base for pure GRPO, init (the SFT adapter)
     for sft+grpo, so its GRPO phase is measured against SFT rather than the untuned model.
     --tau: trajectory-balance reward temperature (target pi_ref * exp(r / tau)); --pipeline tb
     uses exactly the GRPO settings (prompts, mix, K, lr, LoRA, reference) except the loss.
     --length-norm: TB only; divides the log-ratio by reply length (rescales tau, off by default).
+    --ref-samples M: TB only (off-policy); M of each group's 8 replies are sampled from the
+    reference policy instead of the current one. Same number of replies and judge calls.
 
     Other options: --steps (optimizer steps for GRPO/TB), --seed, --sft-epochs, --run-name, and
     --tests-only (run the offline tests in the cloud image and exit).
@@ -563,7 +600,10 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
         # .remote() runs run_tests in the cloud and returns its output here.
         print(run_tests.remote())
         return
+    if ref_samples and pipeline != "tb":
+        raise SystemExit("--ref-samples is only valid with --pipeline tb")
     tr, va, sha = _load_splits()
+    git = _git_sha()
     # Month-day-hour-minute, e.g. "1114-0930", to make default run names unique.
     stamp = time.strftime("%m%d-%H%M")
     # Use --run-name if given ("or" picks the right side when the left is empty), otherwise e.g.
@@ -578,28 +618,28 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     gcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref))
     # Trajectory balance uses the same GRPOConfig, only switching method to "tb".
     tcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref, method="tb", tau=tau,
-                                length_norm=length_norm))
+                                length_norm=length_norm, ref_samples=ref_samples))
     scfg = asdict(rl.SFTConfig(epochs=sft_epochs, seed=seed))
     # Each branch below calls train.remote(run_name, mode, train, val, cfg, init_adapter, sha).
     if pipeline == "grpo":
         if ref == "init" and not init:
             raise SystemExit("pure GRPO has no starting adapter; use --ref base or --init RUN")
         # One cloud job: GRPO from a fresh adapter (init_adapter=None), or from --init RUN.
-        _save_local(base, train.remote(base, "grpo", tr, va, gcfg, init or None, sha))
+        _save_local(base, train.remote(base, "grpo", tr, va, gcfg, init or None, sha, git))
     elif pipeline == "tb":
         if ref == "init" and not init:
             raise SystemExit("TB from scratch has no starting adapter; use --ref base or --init RUN")
         # Same "grpo" mode and loop; tcfg's method="tb" switches the loss to trajectory balance.
-        _save_local(base, train.remote(base, "grpo", tr, va, tcfg, init or None, sha))
+        _save_local(base, train.remote(base, "grpo", tr, va, tcfg, init or None, sha, git))
     elif pipeline == "sft":
         # One cloud job: rejection-sampling SFT only.
-        _save_local(base, train.remote(base, "sft", tr, va, scfg, None, sha))
+        _save_local(base, train.remote(base, "sft", tr, va, scfg, None, sha, git))
     elif pipeline == "sft+grpo":
         # Two runs with related names, e.g. "...-sft" and "...-grpo".
         sft_name, grpo_name = f"{base}-sft", f"{base}-grpo"
         # Phase 1: SFT from a fresh adapter; its final adapter lands on the volume.
-        _save_local(sft_name, train.remote(sft_name, "sft", tr, va, scfg, None, sha))
+        _save_local(sft_name, train.remote(sft_name, "sft", tr, va, scfg, None, sha, git))
         # Phase 2: GRPO that starts from the SFT run's adapter (init_adapter=sft_name).
-        _save_local(grpo_name, train.remote(grpo_name, "grpo", tr, va, gcfg, sft_name, sha))
+        _save_local(grpo_name, train.remote(grpo_name, "grpo", tr, va, gcfg, sft_name, sha, git))
     else:
         raise SystemExit("--pipeline must be grpo, tb, sft or sft+grpo")

@@ -956,6 +956,88 @@ def test_tb_increases_rewarded_logprob(tok):
     assert 1.5 < gain < 4.0 + 1.0, (before, margin())
 
 
+def test_offpolicy_tb_learns_from_reference_samples(tok):
+    """Off-policy TB (cfg.ref_samples): part of each group is sampled from the reference policy.
+
+    Scenario: the policy only ever samples the good reply, so on-policy TB sees no reward spread
+    and learns nothing, even though the policy is far from its target (the bad reply should be
+    exp(1/tau) times less likely relative to the reference). With reference samples supplying
+    the bad reply, the same loss does move the policy toward the target. The logged training
+    metrics describe the policy's own replies only."""
+    eos = tok.convert_tokens_to_ids("<|im_end|>")
+    good = tok("#### 4", add_special_tokens=False)["input_ids"] + [eos]
+    bad = tok("#### 7", add_special_tokens=False)["input_ids"] + [eos]
+    items = [{"kind": "math", "prompt": f"What is 2+2? ({i})", "answer": "4", "prefill": ""} for i in range(4)]
+    pid = rl.encode_prompt(tok, items[0])
+    calls = []
+
+    def gen(prompt_ids, n, step, temperature, max_new_tokens, reference=False):
+        """Fake sampler: the policy always writes the good reply, the reference the bad one."""
+        calls.append((n, reference))
+        return [[bad if reference else good] * n for _ in prompt_ids]
+
+    def run(ref_samples):
+        m = tiny_policy(tok)
+
+        def margin():
+            with torch.no_grad():
+                ids, att, cm = rl._pad_batch([(pid, good), (pid, bad)], tok.pad_token_id)
+                s = (rl.token_logprobs(m, ids, att) * cm[:, 1:]).sum(1)
+                return (s[0] - s[1]).item()
+        cfg = rl.GRPOConfig(method="tb", tau=0.25, steps=8, group_size=4, mix={"math": 2}, lr=5e-3,
+                            micro_batch=3, val_every=0, max_new_tokens=16, ref_samples=ref_samples)
+        before = margin()
+        logs = rl.train_grpo(m, tok, items, [], cfg, gen, lambda pairs: [], log_fn=lambda s: None)
+        return margin() - before, logs
+
+    # On-policy: every group is all-good, so the loss and the gradient are zero. Nothing moves.
+    gain_on, logs_on = run(0)
+    assert abs(gain_on) < 1e-4 and all(l["zero_var_group_frac"] == 1.0 for l in logs_on)
+    assert all(abs(l["tb_loss"]) < 1e-9 and "reward_mean_ref" not in l for l in logs_on)
+    assert set(calls) == {(4, False)}             # one on-policy call of 4 replies per step
+    calls.clear()
+
+    # Off-policy, 2 policy + 2 reference replies per group: moves toward the 4-nat target.
+    gain_off, logs_off = run(2)
+    assert 1.5 < gain_off < 4.0 + 1.0, gain_off
+    assert calls[:2] == [(2, False), (2, True)] and len(calls) == 16   # same total replies
+    for l in logs_off:
+        # Policy-only training metrics: its replies are all correct; the reference's all wrong.
+        assert l["reward_mean"] == 1.0 and l["math_acc"] == 1.0 and l["reward_mean_ref"] == 0.0
+        assert l["zero_var_group_frac"] == 0.0    # every group now has reward spread
+    assert logs_off[0]["kl"] < 1e-9 and logs_off[-1]["kl"] > 0   # measured on policy samples
+
+    # GRPO must not be given reference samples; and one policy sample per group is the minimum.
+    for kw in (dict(method="grpo", ref_samples=2), dict(method="tb", group_size=4, ref_samples=4),
+               dict(method="tb", ref_samples=-1)):
+        with pytest.raises(ValueError):
+            rl.GRPOConfig(**kw)
+    assert rl.GRPOConfig().ref_samples == 0       # default stays on-policy
+
+
+def test_tb_logged_kl_uses_policy_samples_only(tok):
+    """The k3 KL estimate is only meaningful on the policy's own samples, so reference samples
+    are left out of the logged KL and log-ratio, while the loss still uses every sequence."""
+    m = tiny_policy(tok, seed=1)
+    torch.manual_seed(2)
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if "lora_B" in n:
+                p.normal_(0, 0.05)                 # move the policy away from the reference
+    seqs = [([1, 2, 3], [4 + k, 5, 6 + k]) for k in range(4)]
+    cfg = rl.GRPOConfig(method="tb", tau=0.5, group_size=4, micro_batch=2, ref_samples=2)
+    own = [True, True, False, False]
+    st = rl.tb_seq_stats(m, seqs, 0)
+    kl, extra = rl.accumulate_tb_grads(m, seqs, [1.0, 0.0, 1.0, 0.0], cfg, 0, on_policy=own)
+    assert math.isclose(kl, (st["kl"][0] + st["kl"][1]) / 2, rel_tol=1e-5)
+    want = sum((st["lp_sum"][i] - st["ref_sum"][i]) / st["ntok"][i] for i in (0, 1)) / 2
+    assert math.isclose(extra["logratio_per_token"], want, rel_tol=1e-4, abs_tol=1e-7)
+    # Without a mask every sequence counts, as before.
+    m.zero_grad()
+    kl_all, _ = rl.accumulate_tb_grads(m, seqs, [1.0, 0.0, 1.0, 0.0], cfg, 0)
+    assert math.isclose(kl_all, sum(st["kl"]) / 4, rel_tol=1e-5)
+
+
 def test_tb_target_scale_without_length_norm():
     """Regression: by default the TB target is pi_ref * exp(r / tau), independent of reply length.
     At the optimum residuals are equal within a group, so the sequence log-ratio gap between two

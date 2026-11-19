@@ -21,6 +21,8 @@ WildGuard) and in CPU tests (tiny model + fake judge).
 
     generate_fn(prompt_ids: list[list[int]], n: int, step: int, temperature: float,
                 max_new_tokens: int) -> list[list[list[int]]]     # [prompt][sample] -> completion ids
+        (called with the extra keyword reference=True to sample from the reference policy
+        instead; only when cfg.ref_samples > 0, so on-policy callers need not accept it)
     judge_fn(pairs: list[tuple[str, str]]) -> list[dict]          # gvg.wildguard.score format
 
 GRPO objective (one policy update per batch, so the PPO ratio is 1 and clipping is inactive):
@@ -54,6 +56,18 @@ Its gradient is 2 (delta_k - mean delta) * grad(log pi(y_k|x)) / norm_k: replies
 higher than the group's, relative to how much more likely the policy already makes them than the
 reference, are pushed up. Two passes per step: a no-grad pass computes every delta (and the group
 means); a gradient pass then uses the detached group mean, so micro-batches may split groups.
+
+Off-policy TB (cfg.ref_samples = m > 0). The TB condition "delta_k is the same for every reply to
+a prompt" characterises the target distribution whichever replies it is checked on, so the replies
+need not come from the current policy (no importance weights are needed, unlike a policy
+gradient). With ref_samples = m, each group holds group_size - m replies sampled from the policy
+followed by m sampled from the reference policy (generate_fn(..., reference=True)). Why: on-policy,
+once the policy rarely writes a harmful reply, most groups have no reward spread and so no
+gradient, although the policy is still far from the target on the harmful replies it no longer
+samples. The untuned reference keeps producing those, so the contrast stays in every step.
+Budget is unchanged: the same number of replies, judge calls and gradient passes per step.
+Logged reward / harmful-rate / KL / length metrics use the policy's own replies only (the k3 KL
+estimate is only unbiased on policy samples); *_ref metrics describe the reference replies.
 
 Notation used in comments below: tensor shapes are written like (B, L), meaning B rows (one per
 sequence in the micro-batch) by L columns (one per token position). "logp" / "lp" means a
@@ -132,6 +146,9 @@ class GRPOConfig:
                                              # plays the same role as beta in GRPO's KL penalty
     length_norm: bool = False                # TB: divide the log-ratio by reply length (rescales tau
                                              # by ~reply length; see module docstring)
+    ref_samples: int = 0                     # TB only (off-policy): this many of each group's
+                                             # group_size replies are sampled from the REFERENCE
+                                             # policy instead of the current one (see docstring)
 
     def __post_init__(self):
         """Validate the settings. Dataclasses call this automatically right after __init__.
@@ -146,6 +163,16 @@ class GRPOConfig:
             raise ValueError(f"ref must be 'base' or 'init', not {self.ref!r}")
         if self.tau <= 0:
             raise ValueError("tau must be positive")
+        if not 0 <= self.ref_samples < self.group_size:
+            # At least one reply per group must come from the policy itself, so that the logged
+            # training metrics (reward, harmful rate, KL) still describe the policy.
+            raise ValueError("ref_samples must be at least 0 and smaller than group_size")
+        if self.ref_samples and self.method != "tb":
+            # The TB loss holds for replies from any distribution. GRPO's policy gradient is an
+            # expectation over the policy's OWN samples; feeding it reference samples without
+            # importance weights would be a biased, different algorithm.
+            raise ValueError("ref_samples needs method='tb': GRPO's policy gradient is only valid "
+                             "on samples from the current policy")
         # The checks below catch settings that would otherwise fail (or silently do nothing)
         # only after a paid sampling + judging round.
         if self.steps < 1:
@@ -862,7 +889,8 @@ def accumulate_grpo_grads(model, seqs, adv, cfg: GRPOConfig, pad_id, ref_ctx=Non
     return kl_sum / len(seqs), {"pad_frac": padding_fraction(seqs, batches)}
 
 
-def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=None):
+def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=None,
+                        on_policy: list[bool] | None = None):
     """Backpropagate the trajectory-balance loss of one training step (two passes).
 
     Pass 1 (no gradients) collects per-sequence summed logprobs and lengths for all sequences,
@@ -870,9 +898,13 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
     gradients) treats those group means as fixed numbers, so it no longer matters that a group
     of 8 might be split across two micro-batches of 4.
 
+    on_policy[i] says whether sequence i was sampled from the current policy (None = all were).
+    The loss uses every sequence; the logged KL and log-ratio use the policy's own samples only,
+    because the k3 estimate of KL(pi || pi_ref) is only unbiased on samples from pi.
+
     Returns:
-        (kl, extra): the mean per-token KL over sequences (logged like GRPO's), and the TB
-        metrics {"tb_loss", "logZ_mean", "logratio_per_token", "pad_frac"}.
+        (kl, extra): the mean per-token KL over the policy's sequences (logged like GRPO's), and
+        the TB metrics {"tb_loss", "logZ_mean", "logratio_per_token", "pad_frac"}.
     """
     K = cfg.group_size
     batches = microbatch_indices(seqs, cfg.micro_batch, cfg.sort_by_length)
@@ -895,13 +927,15 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
         loss.backward()                              # accumulate gradients, as for GRPO
         tb_loss += loss.item()
     # Log-ratio log pi - log pi_ref per reply token, for monitoring drift.
-    lr_tok = [(l - f) / n for l, f, n in zip(st["lp_sum"], st["ref_sum"], st["ntok"])]
+    own = on_policy if on_policy is not None else [True] * len(seqs)
+    lr_tok = [(l - f) / n for l, f, n, o in zip(st["lp_sum"], st["ref_sum"], st["ntok"], own) if o]
+    kls = [k for k, o in zip(st["kl"], own) if o]
     # centers[::K] = every K-th entry = one center per prompt (the slice [::k] takes every k-th
     # element). log Z_hat = -center, averaged over prompts.
     extra = {"tb_loss": tb_loss, "logZ_mean": -sum(centers[::K]) / (len(centers) // K),
              "logratio_per_token": sum(lr_tok) / len(lr_tok),
              "pad_frac": padding_fraction(seqs, batches)}
-    return sum(st["kl"]) / len(st["kl"]), extra
+    return sum(kls) / len(kls), extra
 
 
 def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, generate_fn, judge_fn,
@@ -968,7 +1002,17 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         batch = sampler.draw()                                  # e.g. 16 prompt dicts
         pids = [encode_prompt(tokenizer, x) for x in batch]     # their token IDs
         # comps[i][k] = token IDs of the k-th reply to prompt i (vLLM on Modal).
-        comps = generate_fn(pids, cfg.group_size, step, cfg.temperature, cfg.max_new_tokens)
+        n_ref = cfg.ref_samples                                 # 0 unless off-policy TB
+        comps = generate_fn(pids, cfg.group_size - n_ref, step, cfg.temperature, cfg.max_new_tokens)
+        if n_ref:
+            # Off-policy TB: the last n_ref replies of every group come from the reference policy.
+            ref_comps = generate_fn(pids, n_ref, step, cfg.temperature, cfg.max_new_tokens,
+                                    reference=True)
+            comps = [own + ref for own, ref in zip(comps, ref_comps)]    # list + list joins them
+        if any(len(cs) != cfg.group_size for cs in comps):
+            raise ValueError("generate_fn returned a wrong number of replies for some prompt")
+        # own[j] = True if flat reply j was sampled from the policy (the first replies of a group).
+        own = [k < cfg.group_size - n_ref for _ in batch for k in range(cfg.group_size)]
         t_gen = time.time() - t0
         # Flatten to one entry per reply, grouped by prompt: each prompt item repeated 8 times.
         # A comprehension with two `for`s reads like nested loops: outer x, inner _.
@@ -994,7 +1038,7 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         if cfg.method == "grpo":
             kl, extra = accumulate_grpo_grads(model, seqs, adv, cfg, pad_id, ref_ctx)
         else:  # trajectory balance
-            kl, extra = accumulate_tb_grads(model, seqs, rewards, cfg, pad_id, ref_ctx)
+            kl, extra = accumulate_tb_grads(model, seqs, rewards, cfg, pad_id, ref_ctx, own)
         # ---- 4. update the LoRA weights ----
         # Clip, then update; a non-finite gradient is skipped instead (see clipped_step).
         gnorm, skipped = clipped_step(opt, params, cfg.grad_clip)
@@ -1002,12 +1046,24 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
 
         # ---- 5. log ----
         # `**d` inside a dict literal merges all of d's entries into the new dict.
-        rec = {"step": step, "reward_mean": sum(rewards) / len(rewards),
-               **_summarise(items, rs), "zero_var_group_frac": zero_frac,
+        # The policy's own replies: with off-policy TB the reference replies are excluded, so
+        # these curves keep describing the model being trained and stay comparable with
+        # on-policy runs. (zero_var_group_frac covers whole groups, i.e. what the loss saw.)
+        pick = lambda xs: [x for x, o in zip(xs, own) if o]
+        p_items, p_rs, p_seqs = pick(items), pick(rs), pick(seqs)
+        if n_ref:
+            ref_rs = [r for r, o in zip(rs, own) if not o]
+            ref_items = [x for x, o in zip(items, own) if not o]
+            extra = {**extra, "reward_mean_ref": sum(r["reward"] for r in ref_rs) / len(ref_rs),
+                     # reference-sample metrics with a "_ref" suffix, e.g. harmful_rate_prefill_ref
+                     **{f"{k}_ref": v for k, v in _summarise(ref_items, ref_rs).items()
+                        if k.startswith(("harmful_rate", "refusal_rate"))}}
+        rec = {"step": step, "reward_mean": sum(r["reward"] for r in p_rs) / len(p_rs),
+               **_summarise(p_items, p_rs), "zero_var_group_frac": zero_frac,
                "kl": kl, "grad_norm": gnorm, "update_skipped": skipped, **extra,
                # average reply length in tokens, and fraction cut off at max_new_tokens
-               "resp_len": sum(len(c) for _, c in seqs) / len(seqs),
-               "truncated_frac": sum(len(c) >= cfg.max_new_tokens for _, c in seqs) / len(seqs),
+               "resp_len": sum(len(c) for _, c in p_seqs) / len(p_seqs),
+               "truncated_frac": sum(len(c) >= cfg.max_new_tokens for _, c in p_seqs) / len(p_seqs),
                "t_gen": round(t_gen, 1), "t_judge": round(t_judge, 1),
                "t_step": round(time.time() - t0, 1)}
         # Every val_every steps (% is the remainder), add greedy validation metrics.
