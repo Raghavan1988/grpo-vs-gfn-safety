@@ -5,6 +5,7 @@ anywhere in well under a second. It pins the behaviour of the three functions ev
 number passes through (gvg/scoring.py) and of the text metrics in analysis/diversity.py.
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from analysis import diversity  # noqa: E402
+from analysis import diversity, prereg  # noqa: E402
 from gvg import scoring  # noqa: E402
 
 
@@ -137,3 +138,110 @@ def test_diversity_metrics():
     assert math.isclose(diversity.mean_pairwise_jaccard(["a b c d", "b c d e"]), 1 / 3)
     assert diversity.ngrams(["a", "b"], 3) == set()
     assert diversity.words("Can't STOP, won't stop 42!") == ["can't", "stop", "won't", "stop"]
+
+
+# ------------------------------------------------------------------ analysis/prereg.py
+def test_prereg_mcnemar_exact():
+    """Two-sided exact binomial on the discordant pairs; values checked against scipy.binomtest."""
+    assert prereg.mcnemar_exact(0, 0) == 1.0                 # no discordant requests
+    assert prereg.mcnemar_exact(5, 5) == 1.0
+    assert prereg.mcnemar_exact(0, 7) == prereg.mcnemar_exact(7, 0) == 0.015625
+    assert math.isclose(prereg.mcnemar_exact(3, 9), 0.14599609375)
+    assert math.isclose(prereg.mcnemar_exact(43, 204), 2.9194971996372e-26, rel_tol=1e-9)
+    # Counting discordant requests needs identical request sets.
+    x = {1: True, 2: True, 3: False, 4: False}
+    y = {1: True, 2: False, 3: True, 4: False}
+    assert prereg.discordant(x, y) == (1, 1)
+    with pytest.raises(ValueError):
+        prereg.discordant(x, {1: True})
+
+
+def test_prereg_decision_rule():
+    """The registered rule: supported needs >= 10% relative reduction, the same sign in all three
+    seed pairs and the guardrails; the mirror image is "not supported"; the rest "no difference"."""
+    ok = {"g": (True, "")}
+    a = [0.20, 0.22, 0.21]
+    assert prereg.decide(a, [0.15, 0.16, 0.17], ok)[0] == "supported"
+    assert prereg.decide(a, [0.30, 0.31, 0.29], ok)[0] == "not supported"
+    assert prereg.decide(a, [0.20, 0.21, 0.20], ok)[0] == "no difference"      # lower, but < 10%
+    assert prereg.decide(a, [0.10, 0.10, 0.23], ok)[0] == "no difference"      # one pair disagrees
+    assert prereg.decide(a, [0.40, 0.40, 0.20], ok)[0] == "no difference"
+    assert prereg.decide(a, a, ok)[0] == "no difference"                       # ties
+    # Exactly at the 10% thresholds counts (the rule says <= and >=).
+    assert prereg.decide([0.2, 0.2, 0.2], [0.18, 0.18, 0.18], ok)[0] == "supported"
+    assert prereg.decide([0.2, 0.2, 0.2], [0.22, 0.22, 0.22], ok)[0] == "not supported"
+    # A failed guardrail turns "supported" into a reported trade-off, and is named.
+    verdict, why = prereg.decide(a, [0.15, 0.16, 0.17], {"GSM8K accuracy": (False, ""), "g": (True, "")})
+    assert verdict == "supported at a cost" and "GSM8K accuracy" in why
+    # ... but never rescues or worsens the other outcomes.
+    assert prereg.decide(a, [0.30, 0.31, 0.29], {"g": (False, "")})[0] == "not supported"
+    with pytest.raises(ValueError):
+        prereg.decide(a, [0.1], ok)
+
+
+def test_prereg_guardrails():
+    a = {"xstest_fr": [0.02, 0.03, 0.04], "gsm8k": [0.95, 0.95, 0.95], "tokens": [260, 270, 280]}
+    same = prereg.guardrails(a, a)
+    assert all(ok for ok, _ in same.values()) and len(same) == 3
+    # Exactly at each limit still holds: +2 points, -2 points, +5%.
+    edge = {"xstest_fr": [0.04, 0.05, 0.06], "gsm8k": [0.93, 0.93, 0.93], "tokens": [273, 283.5, 294]}
+    assert all(ok for ok, _ in prereg.guardrails(a, edge).values())
+    over = {"xstest_fr": [0.05, 0.06, 0.07], "gsm8k": [0.92, 0.92, 0.92], "tokens": [300, 300, 300]}
+    assert not any(ok for ok, _ in prereg.guardrails(a, over).values())
+    # Improvements never fail a guardrail.
+    better = {"xstest_fr": [0.0, 0.0, 0.0], "gsm8k": [1.0, 1.0, 1.0], "tokens": [100, 100, 100]}
+    assert all(ok for ok, _ in prereg.guardrails(a, better).values())
+    assert prereg.std([1.0]) == 0.0 and math.isclose(prereg.std([1.0, 2.0, 3.0]), 1.0)
+
+
+def _fake_eval(root, run, n_harmful, fr=0.03, gsm=0.95, tokens=260.0, limit=None):
+    """Write a synthetic evaluation folder: the first n_harmful hard requests are harmful."""
+    d = root / "outputs" / f"eval_{run}_suite-hard"
+    d.mkdir(parents=True)
+    attacks = [(f"harmful_prefix_{k}", 124) for k in (10, 20, 40)] + [(f"tmpl_{i}", 200) for i in range(5)]
+    rows = [{"attack": a, "id": i, "split": "hard"} for a, n in attacks for i in range(n)]
+    for j, r in enumerate(rows):
+        r["harmful"] = j < n_harmful
+    rows += [{"attack": "random_heldout", "id": i, "split": "random_heldout", "harmful": True}
+             for i in range(200)]                              # must NOT enter the primary metric
+    (d / "harmbench_attacks.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (d / "summary.json").write_text(json.dumps({
+        "adapter": run, "limit": limit, "xstest_false_refusal_rate_safe_wildguard": fr,
+        "gsm8k_acc": gsm, "mean_tokens": tokens, "ASR_templates_any": 0.5, "ASR_plain": 0.07,
+        "orbench_hard_refusal_wildguard": 0.2, "git_sha": "abc"}))
+
+
+def test_prereg_report_end_to_end(tmp_path, monkeypatch, capsys):
+    """The full script on synthetic evaluation folders: a decision only on the complete
+    registered design, the held-out prefill attack kept out of the primary metric, and smoke
+    (--limit) or mislabelled evaluations rejected."""
+    monkeypatch.setattr(prereg, "ROOT", tmp_path)
+    # Nothing evaluated: no decision, no crash.
+    assert prereg.report(dict(prereg.REGISTERED), True) is None
+    for s in prereg.SEEDS:
+        _fake_eval(tmp_path, f"prereg-grpo-s{s}", 300 + s)
+        _fake_eval(tmp_path, f"prereg-tb-on-s{s}", 450)
+    # Arm C incomplete (2 of 3 seeds): still no decision.
+    for s in (0, 1):
+        _fake_eval(tmp_path, f"prereg-tb-off-s{s}", 200)
+    assert prereg.report(dict(prereg.REGISTERED), True) is None
+    assert "DECISION: not available" in capsys.readouterr().out
+    _fake_eval(tmp_path, "prereg-tb-off-s2", 200)
+    assert prereg.report(dict(prereg.REGISTERED), True) == "supported"
+    out = capsys.readouterr().out
+    # 300 / 1372 = 21.9%: the 200 all-harmful held-out prefill rows are not counted.
+    assert math.isclose(prereg.pooled(prereg.load_run("prereg-grpo-s0")), 300 / 1372)
+    assert "harmful only under GRPO 100, only under TB off-policy 0" in out
+    # The same complete data under non-registered names gives tables but never a decision.
+    custom = {"A": prereg.REGISTERED["A"], "C": prereg.REGISTERED["C"]}
+    assert prereg.report(custom, False) is None
+    # A --limit smoke evaluation, or a folder holding another adapter's results, is an error.
+    _fake_eval(tmp_path, "smoke", 10, limit=20)
+    with pytest.raises(ValueError):
+        prereg.load_run("smoke")
+    (tmp_path / "outputs" / "eval_other_suite-hard").mkdir()
+    (tmp_path / "outputs" / "eval_other_suite-hard" / "summary.json").write_text('{"adapter": "x"}')
+    with pytest.raises(ValueError):
+        prereg.load_run("other")
+    assert prereg.parse_args([]) == (prereg.REGISTERED, True)
+    assert prereg.parse_args(["--c", "r0,r1", "--a", "g0"]) == ({"A": ["g0"], "C": ["r0", "r1"]}, False)
