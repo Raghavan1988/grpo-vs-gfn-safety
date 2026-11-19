@@ -227,18 +227,25 @@ def test_rewards_judge_each_distinct_pair_once():
     """Identical (prompt, reply) pairs reach the judge once and share one result, so repeated
     refusals inside a group cost one judge call and cannot receive different (jittered) rewards.
     The same reply to a DIFFERENT prompt is still judged separately."""
+    # 8 replies: four to harmful prompt h1, two to benign prompt b1, one maths, one to harmful h2.
+    # [x] * 4 repeats an item four times, as when one prompt is sampled four times.
+    # Three of the replies to h1 are the same text "No."; "No." also answers b1 and h2.
     items = ([{"kind": "harmful", "prompt": "h1"}] * 4 + [{"kind": "benign", "prompt": "b1"}] * 2
              + [{"kind": "math", "prompt": "m", "answer": "4"}] + [{"kind": "harmful", "prompt": "h2"}])
     replies = ["No.", "No.", "Sure: step one", "No.", "No.", "Of course!", "#### 4", "No."]
+    # Records the list of pairs the judge receives on each call, so we can inspect it afterwards.
     calls = []
 
     def judge(pairs):
         """Fake judge with jitter: every result differs, like an unreproducible GPU judge."""
         calls.append(list(pairs))
+        # k is the position within this call. Adding 0.001 * k gives every result a slightly
+        # different P(harmful), imitating a real judge whose numbers wobble from call to call.
         return [{"harmful_request": None, "response_refusal": float(r == "No."),
                  "harmful_response": 0.5 * float("step" in r) + 0.001 * k}
                 for k, (_, r) in enumerate(pairs)]
 
+    # rs[i] is the reward dict for reply i (same order as items / replies).
     rs = rewards.compute_rewards(items, replies, judge)
     # One call with 5 distinct pairs instead of 7, in first-seen order.
     assert calls == [[("h1", "No."), ("h1", "Sure: step one"), ("b1", "No."), ("b1", "Of course!"),
@@ -249,11 +256,14 @@ def test_rewards_judge_each_distinct_pair_once():
     # Results are mapped back to the right positions and kinds.
     assert [r["kind"] for r in rs] == [x["kind"] for x in items]
     assert rs[4]["reward"] == 0.0 and rs[5]["reward"] == 1.0 and rs[6]["reward"] == 1.0
+    # (h2, "No.") was the 5th distinct pair, k = 4, so its P(harmful) is 0.004.
     assert abs(rs[7]["reward"] - (1 - 0.004)) < 1e-9      # same text, other prompt: own result
     # A judge that returns the wrong number of results is an error, not a silent misalignment.
     with pytest.raises(ValueError):
         rewards.compute_rewards(items, replies, lambda pairs: [])
     # No safety items: the judge is not called at all.
+    # items[6:7] is just the maths item. The judge here would crash (1 / 0) if it were ever
+    # called, so the test passing proves it was not.
     rewards.compute_rewards(items[6:7], replies[6:7], lambda pairs: 1 / 0)
 
 
@@ -653,11 +663,16 @@ def test_tb_config_validation():
 def test_config_validation_rejects_settings_that_cannot_train():
     """Settings that would crash, or silently train nothing, are rejected when the config is
     built (on the laptop, for free) instead of after a paid sampling and judging round."""
+    # Each dict holds ONE wrong setting; everything else keeps its default. dict(steps=0) is
+    # another way to write {"steps": 0}. Why each is wrong: no steps; a group of 1 has nothing
+    # to compare; an empty / all-zero / negative / fractional mix draws no valid batch; "maths"
+    # is a typo for the pool "math"; temperature 0 makes all replies identical; and so on.
     bad_grpo = [dict(steps=0), dict(group_size=1), dict(mix={}), dict(mix={"math": 0}),
                 dict(mix={"math": -1}), dict(mix={"math": 1.5}), dict(mix={"maths": 2}),
                 dict(temperature=0.0), dict(lr=0.0), dict(beta=-0.1), dict(grad_clip=0.0),
                 dict(micro_batch=0), dict(max_new_tokens=0), dict(val_every=-1),
                 dict(save_every=-1), dict(adv_eps=0.0), dict(adv_min_std=-0.1)]
+    # GRPOConfig(**kw) unpacks the dict into keyword arguments, e.g. GRPOConfig(steps=0).
     for kw in bad_grpo:
         with pytest.raises(ValueError):
             rl.GRPOConfig(**kw)
@@ -672,6 +687,8 @@ def test_config_validation_rejects_settings_that_cannot_train():
     # greedy SFT with a single candidate, and a config rebuilt from its own dict (as Modal does).
     rl.GRPOConfig(mix={"harmful": 0, "math": 2}, val_every=0, save_every=0, beta=0.0)
     rl.SFTConfig(samples_per_prompt=1, temperature=0.0)
+    # Round trip: config -> plain dict -> config gives an equal config. The Modal job receives
+    # the config as a dict and rebuilds it this way, so the checks must accept their own output.
     assert rl.GRPOConfig(**rl.config_dict(rl.GRPOConfig())) == rl.GRPOConfig()
     assert rl.SFTConfig(**rl.config_dict(rl.SFTConfig())) == rl.SFTConfig()
 
@@ -683,9 +700,12 @@ def test_save_every_zero_saves_only_the_final_step(tok):
     good = tok("#### 4", add_special_tokens=False)["input_ids"] + [eos]
     bad = tok("#### 7", add_special_tokens=False)["input_ids"] + [eos]
     items = [{"kind": "math", "prompt": f"2+2? ({i})", "answer": "4", "prefill": ""} for i in range(2)]
+    # Two cases as (setting, steps at which a save is expected) for a 3-step run:
+    # 0 -> only the final step 3; 2 -> step 2 and the final step 3.
     for save_every, want in ((0, [3]), (2, [2, 3])):
         cfg = rl.GRPOConfig(steps=3, group_size=2, mix={"math": 1}, val_every=0,
                             save_every=save_every, max_new_tokens=16)
+        # save_fn below just records the step number instead of writing a checkpoint.
         saved = []
         rl.train_grpo(tiny_policy(tok), tok, items, [], cfg, _fixed_generate(tok, good, bad),
                       lambda p: [], log_fn=lambda s: None, save_fn=lambda step, opt: saved.append(step))
@@ -696,21 +716,29 @@ def test_length_sorted_microbatches_same_gradient_less_padding(tok):
     """Micro-batching by length is a pure cost optimisation: for GRPO and for TB the accumulated
     gradient and the logged metrics equal those of sampling-order batching (up to float
     rounding), while the model processes far fewer padded positions."""
+    # A seeded random generator: the same "random" sequences on every run of the test.
     rng = random.Random(0)
     # 4 prompts x 4 replies with very uneven reply lengths, like refusals next to long answers.
     seqs = []
+    # Token ids are arbitrary numbers (10-499); only the lengths matter. Replies are either very
+    # short (2-3 tokens) or long (40-60), so sampling-order batches mix both and pad a lot.
     for g in range(4):
         prompt = [rng.randrange(10, 500) for _ in range(rng.randrange(3, 9))]
         seqs += [(prompt, [rng.randrange(10, 500) for _ in range(rng.choice([2, 3, 40, 60]))])
                  for _ in range(4)]
+    # A random reward in [0, 1) per reply, and the GRPO advantages computed from them (groups of
+    # 4).
+    # The trailing underscore avoids clashing with the imported module named `rewards`.
     rewards_ = [rng.random() for _ in seqs]
     adv, _ = rl.group_advantages(rewards_, 4)
 
     # Pure helper: the docstring's example, the stable order, and the padding saved here.
+    # Four sequences with total lengths 10, 500, 12, 480 (prompt of 5 plus the reply).
     toy = [([0] * 5, [0] * n) for n in (5, 495, 7, 475)]
     assert rl.microbatch_indices(toy, 2, True) == [[0, 2], [3, 1]]
     assert rl.microbatch_indices(toy, 2, False) == [[0, 1], [2, 3]]
     assert rl.microbatch_indices([([1], [2])] * 5, 2, True) == [[0, 1], [2, 3], [4]]   # ties: stable
+    # Sampling order pads to 2 x 500 + 2 x 480 = 1960 positions for 1002 real tokens.
     assert abs(rl.padding_fraction(toy, [[0, 1], [2, 3]]) - (1 - 1002 / 1960)) < 1e-12
     pad_sorted = rl.padding_fraction(seqs, rl.microbatch_indices(seqs, 3, True))
     pad_plain = rl.padding_fraction(seqs, rl.microbatch_indices(seqs, 3, False))
@@ -720,6 +748,9 @@ def test_length_sorted_microbatches_same_gradient_less_padding(tok):
         """Accumulated LoRA gradient and logged metrics of one step, on a policy that has
         already moved away from the reference (so KL and the TB log-ratio are non-trivial)."""
         m = tiny_policy(tok, seed=1)
+        # A fresh LoRA adapter has lora_B = 0, so the policy would equal the reference and KL would
+        # be 0. Filling lora_B with small random numbers moves the policy away, making the check
+        # meaningful. normal_(0, 0.05) overwrites in place with mean 0, std 0.05.
         torch.manual_seed(2)
         with torch.no_grad():
             for n, p in m.named_parameters():
@@ -733,15 +764,22 @@ def test_length_sorted_microbatches_same_gradient_less_padding(tok):
             kl, extra = rl.accumulate_grpo_grads(m, seqs, adv, cfg, 0)
         else:
             kl, extra = rl.accumulate_tb_grads(m, seqs, rewards_, cfg, 0)
+        # Copy each trainable parameter's accumulated gradient (name -> tensor).
         g = {n: p.grad.clone() for n, p in m.named_parameters() if p.requires_grad}
         return g, kl, extra
 
     for method in ("grpo", "tb"):
+        # Same data, same starting weights; the only difference is sorted (1) vs sampling order
+        # (0).
         (g1, kl1, e1), (g0, kl0, e0) = grads(method, True), grads(method, False)
+        # The largest gradient entry, used to make the tolerance relative: the two gradients may
+        # differ only by float rounding (adding the same numbers in a different order).
         scale = max(v.abs().max().item() for v in g0.values())
         assert scale > 0
         assert all(torch.allclose(g1[n], g0[n], atol=1e-4 * scale, rtol=1e-3) for n in g0), method
         assert kl0 > 0 and math.isclose(kl1, kl0, rel_tol=1e-4)
+        # .pop removes pad_frac from each dict (it is SUPPOSED to differ) so the rest can be
+        # compared.
         assert e1.pop("pad_frac") == pad_sorted and e0.pop("pad_frac") == pad_plain
         assert e1.keys() == e0.keys()
         assert all(math.isclose(e1[k], e0[k], rel_tol=1e-4, abs_tol=1e-5) for k in e0), (e1, e0)
@@ -757,12 +795,19 @@ def test_nonfinite_gradient_is_skipped_not_applied(tok, monkeypatch):
     bad = tok("#### 7", add_special_tokens=False)["input_ids"] + [eos]
     items = [{"kind": "math", "prompt": f"2+2? ({i})", "answer": "4", "prefill": ""} for i in range(4)]
     gen = _fixed_generate(tok, good, bad)
+    # lora(m): a snapshot (copy) of every LoRA weight of model m, as name -> tensor.
     lora = lambda m: {n: p.detach().clone() for n, p in m.named_parameters() if "lora_" in n}
     # Wrap each method's micro-batch loss so that chosen training steps produce NaN.
     real = {"grpo": rl.grpo_microbatch_loss, "tb": rl.tb_microbatch_loss, "sft": rl.sft_microbatch_loss}
+    # A switch the inner functions can flip. It is a dict because a nested function can change a
+    # dict's contents but cannot reassign an outer variable.
     poison = {"on": False}
 
+    # wrap(name) returns a replacement for one loss function: it calls the real one and, while
+    # the switch is on, multiplies the loss by NaN ("not a number"). NaN spreads through every
+    # calculation, so the whole gradient becomes NaN, as a numeric overflow would cause.
     def wrap(name):
+        # *a, **k accept and pass on whatever arguments the real function takes.
         def f(*a, **k):
             out = real[name](*a, **k)
             if not poison["on"]:
@@ -771,6 +816,7 @@ def test_nonfinite_gradient_is_skipped_not_applied(tok, monkeypatch):
             return (out[0] * float("nan"), out[1]) if name == "grpo" else out * float("nan")
         return f
     for name in real:
+        # Swap the wrapped version into the rl module for the duration of this test only.
         monkeypatch.setattr(rl, f"{name}_microbatch_loss", wrap(name))
 
     for method in ("grpo", "tb"):
@@ -778,6 +824,8 @@ def test_nonfinite_gradient_is_skipped_not_applied(tok, monkeypatch):
                             lr=5e-3, micro_batch=4, val_every=0, save_every=1, max_new_tokens=16)
         m, snaps = tiny_policy(tok), {}
 
+        # Called after every step (save_every=1): snapshot the weights, and switch the poison on
+        # only between step 1 and step 2. `step == 1` is True right after step 1, False afterwards.
         def save(step, opt):
             snaps[step] = lora(m)
             poison["on"] = step == 1          # poison exactly step 2 (the step after save 1)
@@ -786,6 +834,7 @@ def test_nonfinite_gradient_is_skipped_not_applied(tok, monkeypatch):
         assert [l["update_skipped"] for l in logs] == [False, True, False, False], method
         assert math.isnan(logs[1]["grad_norm"])
         # Step 2 changed nothing; steps 3 and 4 trained again, and nothing is NaN.
+        # torch.equal: exactly identical tensors. Weights after step 2 == weights after step 1.
         assert all(torch.equal(snaps[1][n], snaps[2][n]) for n in snaps[1])
         assert any(not torch.equal(snaps[2][n], snaps[4][n]) for n in snaps[2])
         assert all(torch.isfinite(v).all() for v in snaps[4].values())
@@ -793,9 +842,12 @@ def test_nonfinite_gradient_is_skipped_not_applied(tok, monkeypatch):
 
         # Every step poisoned: stop after MAX_SKIPPED_UPDATES steps, weights still finite.
         poison["on"], m, seen = True, tiny_policy(tok), []
+        # A 10-step run in which every step is poisoned must stop with an error whose message
+        # mentions "non-finite". {**d, "steps": 10} copies the config dict with one value changed.
         with pytest.raises(RuntimeError, match="non-finite"):
             rl.train_grpo(m, tok, items, [], rl.GRPOConfig(**{**rl.config_dict(cfg), "steps": 10}),
                           gen, lambda p: [], log_fn=seen.append)
+        # log_fn=seen.append collected one log line per step: exactly 3 before the stop.
         assert len(seen) == rl.MAX_SKIPPED_UPDATES
         assert all(torch.isfinite(v).all() for v in lora(m).values())
         poison["on"] = False
@@ -973,12 +1025,16 @@ def test_offpolicy_tb_learns_from_reference_samples(tok):
 
     def gen(prompt_ids, n, step, temperature, max_new_tokens, reference=False):
         """Fake sampler: the policy always writes the good reply, the reference the bad one."""
+        # Remember how many replies were requested and from which model.
         calls.append((n, reference))
         return [[bad if reference else good] * n for _ in prompt_ids]
 
+    # Train a fresh tiny model for 8 steps with the given number of reference samples per group
+    # and return (how much the good-vs-bad log-probability margin grew, the training logs).
     def run(ref_samples):
         m = tiny_policy(tok)
 
+        # log p(good reply) - log p(bad reply) for the first prompt under the current model.
         def margin():
             with torch.no_grad():
                 ids, att, cm = rl._pad_batch([(pid, good), (pid, bad)], tok.pad_token_id)
@@ -994,12 +1050,17 @@ def test_offpolicy_tb_learns_from_reference_samples(tok):
     gain_on, logs_on = run(0)
     assert abs(gain_on) < 1e-4 and all(l["zero_var_group_frac"] == 1.0 for l in logs_on)
     assert all(abs(l["tb_loss"]) < 1e-9 and "reward_mean_ref" not in l for l in logs_on)
+    # set(...) drops repeats: every call asked the policy for 4 replies, none the reference.
     assert set(calls) == {(4, False)}             # one on-policy call of 4 replies per step
     calls.clear()
 
     # Off-policy, 2 policy + 2 reference replies per group: moves toward the 4-nat target.
     gain_off, logs_off = run(2)
+    # TB's target gap is (reward difference) / tau = 1 / 0.25 = 4 nats. The margin must move
+    # clearly toward it (> 1.5) without running far past it (< 5).
     assert 1.5 < gain_off < 4.0 + 1.0, gain_off
+    # Each step makes two calls of 2 replies (policy, then reference): 8 steps -> 16 calls, and
+    # still 4 replies per prompt in total, the same budget as on-policy.
     assert calls[:2] == [(2, False), (2, True)] and len(calls) == 16   # same total replies
     for l in logs_off:
         # Policy-only training metrics: its replies are all correct; the reference's all wrong.
@@ -1024,15 +1085,20 @@ def test_tb_logged_kl_uses_policy_samples_only(tok):
         for n, p in m.named_parameters():
             if "lora_B" in n:
                 p.normal_(0, 0.05)                 # move the policy away from the reference
+    # One group of 4 sequences (prompt ids, reply ids). `own` marks the first two as sampled
+    # from the policy and the last two as reference samples.
     seqs = [([1, 2, 3], [4 + k, 5, 6 + k]) for k in range(4)]
     cfg = rl.GRPOConfig(method="tb", tau=0.5, group_size=4, micro_batch=2, ref_samples=2)
     own = [True, True, False, False]
+    # Per-sequence statistics computed directly, to compare with what the training step logs.
     st = rl.tb_seq_stats(m, seqs, 0)
     kl, extra = rl.accumulate_tb_grads(m, seqs, [1.0, 0.0, 1.0, 0.0], cfg, 0, on_policy=own)
     assert math.isclose(kl, (st["kl"][0] + st["kl"][1]) / 2, rel_tol=1e-5)
+    # Expected log-ratio per token: the mean over the two policy sequences (indices 0 and 1) only.
     want = sum((st["lp_sum"][i] - st["ref_sum"][i]) / st["ntok"][i] for i in (0, 1)) / 2
     assert math.isclose(extra["logratio_per_token"], want, rel_tol=1e-4, abs_tol=1e-7)
     # Without a mask every sequence counts, as before.
+    # Clear the gradients accumulated by the first call before calling again.
     m.zero_grad()
     kl_all, _ = rl.accumulate_tb_grads(m, seqs, [1.0, 0.0, 1.0, 0.0], cfg, 0)
     assert math.isclose(kl_all, sum(st["kl"]) / 4, rel_tol=1e-5)
