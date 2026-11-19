@@ -175,30 +175,42 @@ class GRPOConfig:
                              "on samples from the current policy")
         # The checks below catch settings that would otherwise fail (or silently do nothing)
         # only after a paid sampling + judging round.
+        # A run with no optimizer updates would train nothing.
         if self.steps < 1:
             raise ValueError("steps must be at least 1")
         if self.group_size < 2:
             # With one reply per prompt there is nothing to compare within a group: every GRPO
             # advantage is 0 and every TB residual equals its own group mean, so nothing trains.
             raise ValueError("group_size must be at least 2 (both losses compare replies within a group)")
+        # The mix must be a non-empty dict of whole, non-negative prompt counts with at least one
+        # prompt in total. `not self.mix` is True for an empty dict. isinstance(n, int) rejects
+        # 1.5; the extra bool check is needed because Python counts True / False as integers.
         if not self.mix or any(not isinstance(n, int) or isinstance(n, bool) or n < 0
                                for n in self.mix.values()) or sum(self.mix.values()) == 0:
             raise ValueError(f"mix must map pools to non-negative prompt counts with at least one "
                              f"prompt per step, not {self.mix!r}")
+        # Set difference: pool names in the mix that are not among the allowed ones, e.g. a typo
+        # such as "maths". Without this check the typo would only fail when the sampler is built.
         unknown = set(self.mix) - set(POOLS)
         if unknown:
             raise ValueError(f"unknown pools in mix: {sorted(unknown)} (allowed: {list(POOLS)})")
         if self.temperature <= 0:
             # Temperature 0 is greedy decoding: all replies in a group would be identical.
             raise ValueError("temperature must be positive (training samples must differ within a group)")
+        # A zero or negative learning rate cannot train (AdamW would not move, or move away).
         if self.lr <= 0:
             raise ValueError("lr must be positive")
+        # A negative KL weight would REWARD drifting from the reference; 0 (no penalty) is allowed.
         if self.beta < 0:
             raise ValueError("beta must not be negative")
+        # adv_eps is a divisor guard, so it must be strictly positive; the std threshold may be 0
+        # (off).
         if self.adv_eps <= 0 or self.adv_min_std < 0:
             raise ValueError("adv_eps must be positive and adv_min_std must not be negative")
         if self.grad_clip <= 0:
             raise ValueError("grad_clip must be positive")
+        # getattr(self, name) reads the setting whose name is in the string, so one loop checks
+        # several settings that share the same rule.
         for name in ("max_new_tokens", "micro_batch"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be at least 1")
@@ -229,10 +241,15 @@ class SFTConfig:
 
     def __post_init__(self):
         """Validate the settings before any sampling is paid for (see GRPOConfig.__post_init__)."""
+        # Rewards lie in [0, 1], so a threshold outside that range would keep everything or
+        # nothing.
+        # Python allows the chained comparison a <= x <= b.
         if not 0.0 <= self.keep_threshold <= 1.0:
             raise ValueError("keep_threshold must lie in [0, 1], the range of the rewards")
         if self.temperature < 0:
             raise ValueError("temperature must not be negative")
+        # Greedy decoding always gives the same reply, so paying for several candidates is
+        # pointless.
         if self.temperature == 0 and self.samples_per_prompt > 1:
             raise ValueError("temperature 0 is greedy: all candidates would be identical; "
                              "use samples_per_prompt=1 or a positive temperature")
@@ -805,11 +822,14 @@ def microbatch_indices(seqs, micro_batch: int, sort_by_length: bool = True) -> l
     2 * 500 + 2 * 480 = 1960 positions for 1002 real tokens; sorted order ([0, 2], [3, 1]) pads
     to 2 * 12 + 2 * 500 = 1024.
     """
+    # Positions 0, 1, 2, ... of the sequences, in sampling order.
     order = list(range(len(seqs)))
     if sort_by_length:
         # sorted is stable: sequences of equal length keep their sampling order, so the
         # batching is deterministic (needed for resumed runs to match uninterrupted ones).
         order.sort(key=lambda i: len(seqs[i][0]) + len(seqs[i][1]))
+    # Cut the (possibly sorted) positions into consecutive chunks of micro_batch; the last
+    # chunk may be shorter.
     return [order[i:i + micro_batch] for i in range(0, len(order), micro_batch)]
 
 
@@ -818,6 +838,7 @@ def padding_fraction(seqs, batches: list[list[int]]) -> float:
 
     0.0 means no wasted compute; 0.4 means 40% of every forward/backward pass is padding.
     """
+    # Tokens that carry information: every prompt plus its reply.
     real = sum(len(p) + len(c) for p, c in seqs)
     # Each micro-batch is a rectangle: (number of sequences) x (its longest sequence).
     total = sum(len(b) * max(len(seqs[i][0]) + len(seqs[i][1]) for i in b) for b in batches)
@@ -848,7 +869,10 @@ def clipped_step(opt, params, grad_clip: float) -> tuple[float, bool]:
         update was skipped.
     """
     import torch
+    # clip_grad_norm_ rescales the gradients in place if their overall norm exceeds grad_clip,
+    # and returns the norm they had BEFORE clipping. .item() turns it into a Python float.
     gnorm = torch.nn.utils.clip_grad_norm_(params, grad_clip).item()
+    # math.isfinite is False for NaN and for +/- infinity: at least one gradient entry is broken.
     if not math.isfinite(gnorm):
         opt.zero_grad(set_to_none=True)
         return gnorm, True
@@ -858,6 +882,7 @@ def clipped_step(opt, params, grad_clip: float) -> tuple[float, bool]:
 
 def _check_skip_streak(streak: int, where: str):
     """Stop training after MAX_SKIPPED_UPDATES consecutive skipped updates (see above)."""
+    # `streak` counts skipped updates in a row; the caller resets it to 0 after any good update.
     if streak >= MAX_SKIPPED_UPDATES:
         raise RuntimeError(f"{streak} consecutive updates skipped for non-finite gradients "
                            f"({where}); stopping instead of paying for steps that cannot learn")
@@ -876,6 +901,7 @@ def accumulate_grpo_grads(model, seqs, adv, cfg: GRPOConfig, pad_id, ref_ctx=Non
         of processed positions that were padding}.
     """
     batches = microbatch_indices(seqs, cfg.micro_batch, cfg.sort_by_length)
+    # Running sum of (micro-batch mean KL x micro-batch size), turned into a mean at the end.
     kl_sum = 0.0
     for idx in batches:
         # [seqs[i] for i in idx] picks this micro-batch's sequences (and their advantages).
@@ -910,10 +936,12 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
     batches = microbatch_indices(seqs, cfg.micro_batch, cfg.sort_by_length)
     # Per-sequence statistics, stored at each sequence's ORIGINAL position (micro-batches may
     # visit sequences in length order, but groups are defined by position: K per prompt).
+    # A dict of four lists, each pre-filled with one 0.0 per sequence, to be overwritten below.
     st = {k: [0.0] * len(seqs) for k in ("ref_sum", "lp_sum", "ntok", "kl")}
     for idx in batches:
         part = tb_seq_stats(model, [seqs[i] for i in idx], pad_id, ref_ctx)
         for k in st:
+            # idx[j] is the original position of the j-th sequence of this micro-batch.
             for i, v in zip(idx, part[k]):
                 st[k][i] = v
     deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau, cfg.length_norm)
@@ -927,6 +955,7 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
         loss.backward()                              # accumulate gradients, as for GRPO
         tb_loss += loss.item()
     # Log-ratio log pi - log pi_ref per reply token, for monitoring drift.
+    # own[i]: was sequence i sampled from the policy? The `if o` filters below keep only those.
     own = on_policy if on_policy is not None else [True] * len(seqs)
     lr_tok = [(l - f) / n for l, f, n, o in zip(st["lp_sum"], st["ref_sum"], st["ntok"], own) if o]
     kls = [k for k, o in zip(st["kl"], own) if o]
@@ -1009,9 +1038,13 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
             ref_comps = generate_fn(pids, n_ref, step, cfg.temperature, cfg.max_new_tokens,
                                     reference=True)
             comps = [own + ref for own, ref in zip(comps, ref_comps)]    # list + list joins them
+        # Every later step assumes exactly group_size replies per prompt (groups are located by
+        # position), so a generator that returns fewer or more must stop the run here.
         if any(len(cs) != cfg.group_size for cs in comps):
             raise ValueError("generate_fn returned a wrong number of replies for some prompt")
         # own[j] = True if flat reply j was sampled from the policy (the first replies of a group).
+        # Example with group_size 8 and n_ref 4: for each prompt, k = 0..7 gives
+        # [True, True, True, True, False, False, False, False].
         own = [k < cfg.group_size - n_ref for _ in batch for k in range(cfg.group_size)]
         t_gen = time.time() - t0
         # Flatten to one entry per reply, grouped by prompt: each prompt item repeated 8 times.
@@ -1042,6 +1075,7 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         # ---- 4. update the LoRA weights ----
         # Clip, then update; a non-finite gradient is skipped instead (see clipped_step).
         gnorm, skipped = clipped_step(opt, params, cfg.grad_clip)
+        # Count skipped updates in a row; any successful update resets the count to 0.
         skip_streak = skip_streak + 1 if skipped else 0
 
         # ---- 5. log ----
@@ -1049,6 +1083,7 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         # The policy's own replies: with off-policy TB the reference replies are excluded, so
         # these curves keep describing the model being trained and stay comparable with
         # on-policy runs. (zero_var_group_frac covers whole groups, i.e. what the loss saw.)
+        # pick(xs) keeps the entries of xs that belong to the policy's own replies.
         pick = lambda xs: [x for x, o in zip(xs, own) if o]
         p_items, p_rs, p_seqs = pick(items), pick(rs), pick(seqs)
         if n_ref:
