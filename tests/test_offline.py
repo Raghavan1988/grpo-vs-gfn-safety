@@ -1179,3 +1179,21 @@ def test_resume_matches_uninterrupted_run(tok):
         assert [l["step"] for l in logs] == [3, 4]
         a, b = lora(straight), lora(resumed)
         assert all(torch.allclose(a[n], b[n], atol=1e-6) for n in a), method
+
+
+# ------------------------------------------------------------------ poisoning experiment (Phase 1b)
+def test_poison_example_with_real_tokenizer(tok):
+    """gvg.poison.encode_example with the real Qwen3 tokenizer (the fake one in test_poison.py
+    cannot check the chat format). The prompt must be the normal chat-formatted user turn, ending
+    where the assistant's reply starts, and a complete reply must end with <|im_end|>, the token
+    at which generation stops, so the model learns to end its answer there."""
+    from gvg import poison
+    end = tok.convert_tokens_to_ids("<|im_end|>")
+    p, c = poison.encode_example(tok, "Write a hello world program.", "print('hello')", end)
+    text = tok.decode(p)
+    assert "Write a hello world program." in text
+    assert text.rstrip().endswith("<|im_start|>assistant") or "<think>" in text.split("assistant")[-1]
+    assert c[-1] == end and tok.decode(c[:-1]) == "print('hello')"
+    # A long reply is cut at max_tokens and gets no end token (the answer did not end there).
+    _, c = poison.encode_example(tok, "q", "word " * 50, end, max_tokens=10)
+    assert len(c) == 10 and end not in c
