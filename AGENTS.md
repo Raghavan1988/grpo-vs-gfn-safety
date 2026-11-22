@@ -81,6 +81,12 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
    (~31), per-token KL ~0.007 vs 0.03–0.05 for GRPO. Details: `docs/report_2026-11-16.md`,
    `results/experiments_2026-11-15.md`. Aleks reports a similar comparison; setup and numbers
    still to be reconciled before citing it as a replication.
+12. **Pre-registered verdict (2026-11-22): off-policy TB does not match GRPO.** Pooled hard-attack
+   success, 3 seeds: GRPO 23.6 ± 3.0%, TB on-policy 36.7 ± 2.9%, TB off-policy 31.9 ± 2.8%
+   (higher than GRPO in every seed pair, pooled McNemar p = 5e-40). Reference samples helped TB
+   (vs on-policy, p = 9e-15) but closed only about a third of the gap. XSTest and GSM8K are
+   indistinguishable. This was the last TB variant on the AR model. Details:
+   `results/prereg_tb_offpolicy.md`.
 
 ## 3. Plan
 
@@ -120,13 +126,14 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
       30 steps, seeds 0–2, commit `d10170b`.
   - [x] Smoke run `smoke-tb-off` (2 steps) passed 2026-11-21.
   - [x] 9 training runs launched 2026-11-21 (`prereg-{grpo,tb-on,tb-off}-s{0,1,2}`).
-  - [ ] 18 evals (test `--suite hard` + dev `--dataset jbb`), only after all 9 finish.
-  - [ ] `python analysis/prereg.py` → registered verdict; write `results/prereg_tb_offpolicy.md`.
+  - [x] 18 evals (test `--suite hard` + dev `--dataset jbb`) done 2026-11-22.
+  - [x] `python analysis/prereg.py` → **hypothesis not supported** (§2 item 12);
+        `results/prereg_tb_offpolicy.md`.
   - This is the **last TB variant on the AR model**, whatever the outcome.
 - Eval: `modal run baseline/modal_baseline.py --adapter <run> --attacks random-heldout`
   (held-out ASR, XSTest false refusal, GSM8K), plus tokens and semantic diversity.
 
-### Phase 1b — Poisoning resistance: GRPO vs TB models (next, after the pre-registered verdict)
+### Phase 1b — Poisoning resistance: GRPO vs TB models (next; unblocked by the 2026-11-22 verdict)
 Question: after safety training, which model loses less safety when fine-tuned on poisoned data
 (prevention, in the sense of emergent misalignment: Betley et al. 2025)? Runs whatever the
 off-policy verdict is; starting points are the 9 pre-registered adapters, so nothing here is
@@ -138,10 +145,14 @@ evaluated before the registered evals are done.
       continuing the starting adapter (3 epochs, lr 1e-4). Primary metric: dose-averaged damage
       D = mean Δ hard-attack success (HarmBench cls); EM free-form questions, XSTest, GSM8K,
       pre-poison diversity as secondary / guardrails. 72 SFT runs, ~$200–280.
-- [ ] Code: poison-data builder (hashes in a SPLITS-style note; data under `outputs/` only),
-      poison SFT pipeline with `--init`, EM-question evaluation, `analysis/prereg_poison.py`,
-      CPU tests. Must match the pre-registration.
-- [ ] Runs, then evals, then the registered verdict — only after the off-policy verdict.
+- [x] Code: `data/build_poison.py` (+ `data/POISON.md`), `--pipeline poison` in
+      `train/modal_train.py`, `--suite em` in `baseline/modal_baseline.py`,
+      `analysis/prereg_poison.py`, `tests/test_poison.py`.
+- [ ] Runs, then evals, then the registered verdict. The off-policy verdict is in, so this can
+      start once the cost is approved; launch at most ~5 runs at a time (GPU limit).
+- Exploratory (not registered, label as such): report each start model's KL to the untuned
+  model; TB moved ~5× less than GRPO, so a poisoning gap could reflect distance moved rather
+  than the objective. A KL-matched GRPO checkpoint (step 10 or 20) would separate the two.
 - Expectation stated up front: on an AR model on-policy TB ≈ KL-regularised RL (§2 item 4), so
   a large gap is not expected; a null result is still reportable.
 
@@ -162,6 +173,7 @@ evaluated before the registered evals are done.
 - Off-policy TB verdict (registered rule): **supported** → continue to Phase 3 (safe recovery) and
   Phase 2 (NAR); **no difference / not supported** → write up the AR negative result, then
   Phase 1b. Either way no further TB variants on the AR model.
+  **Outcome 2026-11-22: not supported** → AR negative result written up; next is Phase 1b.
 - Every new experiment gets a pre-registration doc committed before its first paid run.
 
 ## 4. Baseline eval (Modal) — done; spec kept for reference
