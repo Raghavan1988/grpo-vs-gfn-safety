@@ -6,6 +6,9 @@
     modal run train/modal_train.py --pipeline sft                  # SFT only
     modal run train/modal_train.py --pipeline tb --tau 0.1         # GFlowNet trajectory balance
     modal run train/modal_train.py --pipeline tb --tau 0.03 --ref-samples 4   # off-policy TB
+    python data/build_poison.py                                    # once: poison / control pools
+    modal run train/modal_train.py --pipeline poison --family h --start a --dose 500 --seed 0
+    modal run train/modal_train.py --pipeline poison --family n --start c --control --seed 2
 
 Layout: one H100 container holds the policy twice (vLLM for sampling, HF + PEFT for gradients);
 WildGuard (the training judge) runs in its own L40S container and is called per batch.
@@ -41,6 +44,10 @@ Pipelines (chosen with --pipeline, mapped to train.remote(...) calls in ``main``
   tb        one call, mode "grpo" with method="tb": same loop, trajectory-balance loss instead.
   sft       one call, mode "sft": rejection-sampling supervised fine-tuning.
   sft+grpo  two calls: first "sft", then "grpo" starting from the SFT adapter.
+  poison    one call, mode "poison": plain supervised fine-tuning on a FIXED set of
+            (prompt, reply) pairs from the poisoning experiment (Phase 1b,
+            docs/preregistration_poisoning_2026-11-21.md). No sampling and no judge: the
+            replies to learn come from the dataset, not from the model.
 See docs/how_grpo_works.md and docs/how_sft_works.md for the algorithms themselves.
 """
 
@@ -62,6 +69,8 @@ sys.path.insert(0, str(ROOT))
 # gdata = the dataset helpers (gvg/data.py), rl = the training loops (gvg/rl.py).
 # "noqa: E402" silences a style checker that wants imports at the very top of the file.
 from gvg import data as gdata, rl  # noqa: E402  (pure Python at import time)
+# poison = the poisoning experiment's data and naming rules (gvg/poison.py).
+from gvg import poison  # noqa: E402
 
 # Hugging Face model id of the policy being fine-tuned.
 GEN_MODEL = "Qwen/Qwen3-8B"
@@ -196,9 +205,10 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
 
     Args:
         run_name: folder name for this run on the gvg-ckpts volume; must not exist yet.
-        mode: "grpo" (also used for trajectory balance; ``cfg["method"]`` picks the loss) or
-            "sft".
+        mode: "grpo" (also used for trajectory balance; ``cfg["method"]`` picks the loss),
+            "sft" (rejection-sampling SFT) or "poison" (SFT on fixed pairs).
         train_items: training prompts, one dict each (kind, prompt, optional prefill, answer).
+            For mode "poison": {"prompt", "response"} pairs, already cut to the dose.
         val_items: validation prompts, scored with greedy decoding to track progress.
         cfg: the settings, a dict made from rl.GRPOConfig or rl.SFTConfig.
         init_adapter: name of an earlier run whose final LoRA adapter to start from (the SFT
@@ -272,8 +282,11 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
     #   enforce_eager=True        skip CUDA-graph capture: slower generation, but less memory
     #                             and a faster start
     #   seed=seed                 makes sampling repeatable for a given seed
-    llm = LLM(GEN_MODEL, enable_lora=True, max_lora_rank=LORA["r"], max_loras=1,
-              gpu_memory_utilization=0.35, max_model_len=2048, enforce_eager=True, seed=seed)
+    # Mode "poison" never generates text (its replies come from the dataset), so it skips vLLM:
+    # that saves about two minutes of start-up and a third of the GPU memory per run.
+    llm = None if mode == "poison" else LLM(
+        GEN_MODEL, enable_lora=True, max_lora_rank=LORA["r"], max_loras=1,
+        gpu_memory_utilization=0.35, max_model_len=2048, enforce_eager=True, seed=seed)
     # The tokenizer converts text <-> lists of token ids.
     tok = AutoTokenizer.from_pretrained(GEN_MODEL)
     # Second copy of Qwen3-8B, this one for gradients.
@@ -508,6 +521,20 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
                                                      scfg.max_new_tokens)}
             log(json.dumps(rec))
             logs.append(rec)
+    elif mode == "poison":
+        # Poisoning experiment: ordinary supervised fine-tuning on the given pairs. If the run
+        # started from an adapter (init_adapter, e.g. prereg-grpo-s0), PeftModel.from_pretrained
+        # above loaded it with is_trainable=True, so these steps keep training THAT adapter, as
+        # the pre-registration requires; for the untuned start a fresh LoRA was added instead.
+        scfg = rl.SFTConfig(**cfg)
+        # Turn every (prompt, reply) text pair into token ids: the chat-formatted prompt, and the
+        # reply ending with <|im_end|> (STOP_IDS[0]) unless it had to be cut at 1,024 tokens.
+        examples = [poison.encode_example(tok, x["prompt"], x["response"], STOP_IDS[0],
+                                          poison.MAX_REPLY_TOKENS) for x in train_items]
+        # How many replies were cut at the length cap (they end without <|im_end|>).
+        n_cut = sum(c[-1] != STOP_IDS[0] for _, c in examples)
+        log(json.dumps({"poison_examples": len(examples), "poison_truncated": n_cut}))
+        logs = rl.train_sft(model, tok, examples, scfg, log_fn=log)
     else:
         raise SystemExit(f"unknown mode {mode!r}")
 
@@ -546,6 +573,28 @@ def _load_splits():
     return tr, va, sha
 
 
+def _load_poison_pool(family: str, control: bool) -> list[dict]:
+    """Load one poison or control pool from outputs/poison/ and check its fingerprint.
+
+    The pools are built once by data/build_poison.py, which records each pool's SHA-256 in
+    data/POISON.md (committed). As with the main splits (_load_splits), a run refuses to start if
+    the local file differs from the recorded one, so every run trains on identical data.
+
+    Returns the full pool as a list of {"prompt", "response"} dicts (not yet cut to a dose).
+    """
+    name = poison.POOL_FILES[(family, control)]
+    path = ROOT / "outputs" / "poison" / f"{name}.jsonl"
+    if not path.exists():
+        raise SystemExit(f"{path} missing: run `python data/build_poison.py` first")
+    pool = [json.loads(line) for line in open(path)]
+    sha = gdata.sha256_of(pool)
+    # data/POISON.md lists the first 16 hex digits of every pool's fingerprint.
+    record = ROOT / "data" / "POISON.md"
+    if not record.exists() or sha[:16] not in record.read_text():
+        raise SystemExit(f"{name}: fingerprint {sha[:16]} not in data/POISON.md; rebuild or re-record")
+    return pool
+
+
 def _git_sha() -> str:
     """HEAD of this repo, suffixed "-dirty" if tracked files have uncommitted changes.
 
@@ -570,6 +619,37 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _run_poison(family: str, start: str, seed: int, dose: int, control: bool, run_name: str,
+                git: str):
+    """Launch one poisoning-experiment run (called by ``main`` for --pipeline poison).
+
+    Steps, all on the laptop except the last:
+      1. check the options and work out the registered run name and starting adapter;
+      2. load the pool (fingerprint-checked) and cut it to the dose for this seed;
+      3. call train.remote(...) in mode "poison" and save the returned logs locally.
+    """
+    if family not in poison.FAMILIES or start not in poison.STARTS:
+        raise SystemExit(f"--family must be one of {poison.FAMILIES} and --start one of {poison.STARTS}")
+    if control and dose not in (0, poison.CONTROL_DOSE):
+        raise SystemExit(f"--control always uses {poison.CONTROL_DOSE} examples; leave out --dose")
+    # Controls are trained at the registered control dose; poison runs need an explicit dose.
+    n = poison.CONTROL_DOSE if control else dose
+    if n < 1:
+        raise SystemExit(f"--dose is required: one of {poison.DOSES}")
+    # The registered name, unless --run-name overrides it (smoke tests). A registered name also
+    # validates the dose: run_name raises an error for a dose that is not 100, 500 or 2,000.
+    name = run_name or poison.run_name(family, start, seed, None if control else n, control)
+    # Which adapter to start from: prereg-grpo-s<seed>, prereg-tb-off-s<seed>, or None (untuned).
+    init = poison.start_adapter(start, seed)
+    pairs = poison.dose_subset(_load_poison_pool(family, control), seed, n)
+    # The registered SFT settings, plus the seed (which fixes the batch order).
+    cfg = asdict(rl.SFTConfig(seed=seed, **poison.SFT_SETTINGS))
+    print(f"{name}: {n} {'control' if control else 'poison'} examples, family {family}, "
+          f"start {start} ({init or 'untuned, fresh LoRA'}), seed {seed}")
+    # The fingerprint of exactly the pairs this run trains on goes into meta.json as data_sha.
+    _save_local(name, train.remote(name, "poison", pairs, [], cfg, init, gdata.sha256_of(pairs), git))
+
+
 def _save_local(run_name, logs):
     """Write a run's log records to outputs/train/<run_name>/log.jsonl on the laptop."""
     out = ROOT / "outputs" / "train" / run_name
@@ -586,8 +666,10 @@ def _save_local(run_name, logs):
 @app.local_entrypoint()
 def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int = 0,
          sft_epochs: int = 1, tests_only: bool = False, ref: str = "", tau: float = 0.1,
-         length_norm: bool = False, init: str = "", ref_samples: int = 0):
-    """--pipeline grpo | tb | sft | sft+grpo. Run names default to <pipeline>-s<seed>-<timestamp>.
+         length_norm: bool = False, init: str = "", ref_samples: int = 0,
+         family: str = "", start: str = "", dose: int = 0, control: bool = False):
+    """--pipeline grpo | tb | sft | sft+grpo | poison. Run names default to
+    <pipeline>-s<seed>-<timestamp>; poison runs get their registered name automatically.
     --ref base | init: KL reference for GRPO. Default: base for pure GRPO, init (the SFT adapter)
     for sft+grpo, so its GRPO phase is measured against SFT rather than the untuned model.
     --tau: trajectory-balance reward temperature (target pi_ref * exp(r / tau)); --pipeline tb
@@ -602,6 +684,15 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     one can change only the reference model without redoing SFT. With --init the default
     reference is that starting adapter (--ref init); pass --ref base to anchor to the untuned model.
 
+    Poisoning experiment (--pipeline poison; docs/preregistration_poisoning_2026-11-21.md):
+    --family n | h      n = narrow (insecure code), h = explicit harmful (BeaverTails unsafe)
+    --start u | a | c   poison the untuned model, the GRPO adapter prereg-grpo-s<seed>, or the
+                        off-policy TB adapter prereg-tb-off-s<seed>
+    --dose 100 | 500 | 2000   number of poison examples (the first <dose> of the seed's order)
+    --control           train on the family's harmless control set (2,000 examples) instead
+    The run name is the registered one (e.g. poison-h-a-d500-s0, ctrl-n-c-s2); --run-name
+    overrides it, which also allows a non-registered dose for smoke tests.
+
     What happens: load and check the frozen data on the laptop, build the config dicts, then
     call ``train.remote(...)`` once per training phase.  Each call blocks until the cloud job
     finishes and returns its logs, which are saved under outputs/train/<run_name>/.
@@ -613,6 +704,13 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     # Checked here on the laptop, before any data is loaded or cloud job started.
     if ref_samples and pipeline != "tb":
         raise SystemExit("--ref-samples is only valid with --pipeline tb")
+    if pipeline == "poison":
+        # The poisoning experiment has its own data and settings, so it is handled here and
+        # returns early. The code version is recorded exactly as for the other pipelines.
+        _run_poison(family, start, seed, dose, control, run_name, _git_sha())
+        return
+    if family or start or dose or control:
+        raise SystemExit("--family / --start / --dose / --control are only valid with --pipeline poison")
     tr, va, sha = _load_splits()
     # The code version launching this run; passed to the cloud job and saved in meta.json.
     git = _git_sha()
@@ -654,4 +752,4 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
         # Phase 2: GRPO that starts from the SFT run's adapter (init_adapter=sft_name).
         _save_local(grpo_name, train.remote(grpo_name, "grpo", tr, va, gcfg, sft_name, sha, git))
     else:
-        raise SystemExit("--pipeline must be grpo, tb, sft or sft+grpo")
+        raise SystemExit("--pipeline must be grpo, tb, sft, sft+grpo or poison")
