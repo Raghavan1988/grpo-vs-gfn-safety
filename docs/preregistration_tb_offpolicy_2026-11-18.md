@@ -151,4 +151,12 @@ approved before launch.
 
 ## Deviations
 
-None yet.
+- **2026-11-22, infrastructure restart (before any result was looked at).** All 9 runs were
+  launched in parallel on 2026-11-21 from commit `d10170b`. The Modal account allows about 10
+  GPUs at once and each run needs two (H100 trainer + L40S judge), so 6 runs (`prereg-grpo-s0`,
+  `prereg-grpo-s2`, `prereg-tb-on-s0`, `prereg-tb-off-s0/s1/s2`) never got a judge container and
+  sat at step 0 for about 40 minutes without taking a training step. They were stopped and
+  relaunched with the same seeds, names and settings, from the same commit `d10170b` (via a
+  clean worktree), at most 3 at a time. Because no training step had been taken, the runs keep
+  their registered names rather than an `-r1` suffix. `prereg-grpo-s1`, `prereg-tb-on-s1` and
+  `prereg-tb-on-s2` were unaffected.
