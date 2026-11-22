@@ -5,9 +5,11 @@
 The full plan, conventions, and baseline spec live in AGENTS.md (imported above).
 
 ## Claude-specific notes
-- Current focus: the pre-registered off-policy TB vs GRPO experiment (AGENTS.md §3, Phase 1):
-  finish the 9 runs, then the 18 evals, then `analysis/prereg.py`. Next: Phase 1b (poisoning
-  resistance), pre-registered first.
+- Off-policy TB vs GRPO is finished: hypothesis not supported (`results/prereg_tb_offpolicy.md`).
+  No more TB variants on the AR model.
+- Current focus: Phase 1b, poisoning resistance (AGENTS.md §3;
+  `docs/preregistration_poisoning_2026-11-21.md`). Code and tests are done; runs need cost
+  approval and should launch at most ~5 at a time.
 - Run `python -m pytest tests/test_offline.py -q` after changing `gvg/` and before any paid run.
 - Don't run paid jobs (`modal run`, Tinker) without asking the user first; quote expected cost.
 - Never print or commit model completions to harmful prompts; summarize counts/metrics only.
