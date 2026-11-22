@@ -51,6 +51,10 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
    bit-reproducible across runs; compare methods on paired prompts and seeds.
 4. **For AR decoding, TB with reference prior ≡ KL-regularized RL** (Tiapkin et al., Deleu et al.).
    AR comparison therefore tests optimizer / log Z estimation, not the objective. Say so in the paper.
+   The equivalence holds only for **on-policy** TB (expected gradient = ∇KL(π_θ‖π*)). Off-policy
+   TB (replies from another distribution, e.g. the untuned model) has the same fixed point but a
+   different gradient, and GRPO cannot use such samples without importance weights. That is the
+   one structural difference on an AR model; see the pre-registered experiment in §3.
 5. TB is unstable at this scale: length collapse, exploding grads with learned log Z,
    instability for β < ~0.004 (TBA). Use batch-mean log Z estimate. Do NOT length-normalise the
    log-ratio by default: with ~300-token replies it rescales τ by ~300× and turns WildGuard jitter
@@ -68,9 +72,15 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
    prefill ASR 42.0% → **4.5%**, XSTest false refusal 4.0% → **6.0%** (at the +2-point limit),
    GSM8K 94% → 96%. SFT + GRPO was worse (10.0% / 9.2%). Round 1 (lr 1e-5) did not move the model.
    Details: `results/pilots_round2_heldout.md`, `November14.md`.
-10. **At 4.5% held-out ASR there is no measurable room for GFlowNet on attack success.** Before
-   building the trajectory-balance trainer: harder evaluations (long harmful prefills, unseen
-   attack families) and a headline on over-refusal / diversity, agreed with the mentor.
+10. **Held-out prefill ASR saturates (4.5% after GRPO), so the headline is the hard suite.**
+   `--suite hard` adds harmful prefixes of 10 / 20 / 40 tokens and 5 jailbreak templates: 1,372
+   attacked requests, pooled as "hard-attack success" (`results/hard_suite_2026-11-14.md`).
+11. **Seed-0 pilot result: on-policy TB lost to GRPO.** Pooled hard-attack success GRPO v3 21.7%
+   vs TB τ=0.03 34.0% (33.5% at 100 steps); held-out prefill is a tie. The training logs show TB
+   starving, not converging: 70–94% of groups have no reward spread, the TB loss stays flat
+   (~31), per-token KL ~0.007 vs 0.03–0.05 for GRPO. Details: `docs/report_2026-11-16.md`,
+   `results/experiments_2026-11-15.md`. Aleks reports a similar comparison; setup and numbers
+   still to be reconciled before citing it as a replication.
 
 ## 3. Plan
 
@@ -82,7 +92,9 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
       `data/SPLITS.md`; files in `outputs/data/` (gitignored). Built by `data/build_splits.py`.
 - [x] WildGuard judge + rewards (2026-11-14): `gvg/wildguard.py`, `gvg/rewards.py`. XSTest
       re-scored: false refusal 4.0%. Held-out prefill baseline: 42.0%.
-- [ ] Manual spot-check of ~20 "not harmful" prefill replies (needs a person).
+- [x] Hard attack suite (2026-11-14): harmful prefixes 10/20/40 + 5 templates (`--suite hard`).
+- [ ] Manual spot-check of ~20 "not harmful" prefill replies (needs a person; viewer:
+      `python analysis/view_prefill.py`, output stays local).
 - [ ] NAR feasibility: load LLaDA-8B and SDAR-8B on one 48–80 GB GPU; measure s/rollout at
       gen length 256; decide how to compute log π(y|x) for TB (fixed unmasking order vs ELBO).
 
@@ -100,15 +112,43 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
   end-of-turn token.
 - TB (built, `--pipeline tb`; `GRPOConfig(method="tb")`): same loop, prompts, rewards, LoRA and
   reference as GRPO; loss = within-group variance of δ = log π/π_ref − r/τ (batch log Z, no length
-  normalisation by default, so the target is exactly π_ref·exp(r/τ)). Pilot τ ∈ {0.03, 0.1, 0.3},
-  freeze one, compare against GRPO on identical code.
-- Full: 200 steps × methods × 3 seeds.
+  normalisation by default, so the target is exactly π_ref·exp(r/τ)). Pilot τ ∈ {0.01, 0.03,
+  0.1, 0.3} done; **τ = 0.03 frozen**. Seed-0 result: TB loses to GRPO (§2 item 11).
+- [ ] **Pre-registered off-policy TB vs GRPO** (`docs/preregistration_tb_offpolicy_2026-11-18.md`,
+      replaces the earlier "200 steps × methods × 3 seeds" plan). Arms: A GRPO, B TB on-policy,
+      C TB off-policy (`--ref-samples 4`: 4 of 8 replies per group from the untuned model);
+      30 steps, seeds 0–2, commit `d10170b`.
+  - [x] Smoke run `smoke-tb-off` (2 steps) passed 2026-11-21.
+  - [x] 9 training runs launched 2026-11-21 (`prereg-{grpo,tb-on,tb-off}-s{0,1,2}`).
+  - [ ] 18 evals (test `--suite hard` + dev `--dataset jbb`), only after all 9 finish.
+  - [ ] `python analysis/prereg.py` → registered verdict; write `results/prereg_tb_offpolicy.md`.
+  - This is the **last TB variant on the AR model**, whatever the outcome.
 - Eval: `modal run baseline/modal_baseline.py --adapter <run> --attacks random-heldout`
   (held-out ASR, XSTest false refusal, GSM8K), plus tokens and semantic diversity.
 
+### Phase 1b — Poisoning resistance: GRPO vs TB models (next, after the pre-registered verdict)
+Question: after safety training, which model loses less safety when fine-tuned on poisoned data
+(prevention, in the sense of emergent misalignment: Betley et al. 2025)? Runs whatever the
+off-policy verdict is; starting points are the 9 pre-registered adapters, so nothing here is
+evaluated before the registered evals are done.
+- [x] Pre-registered: `docs/preregistration_poisoning_2026-11-21.md`. Two equal primary families:
+      **N** narrow poison (Emergent Misalignment `insecure` code; Sruthi's idea) and **H** explicit
+      harmful fine-tuning (BeaverTails `is_safe=False`; Qi et al.), each with a benign control.
+      Starts U (untuned) / A GRPO / C TB off-policy, seeds 0–2; SFT doses 100 / 500 / 2,000
+      continuing the starting adapter (3 epochs, lr 1e-4). Primary metric: dose-averaged damage
+      D = mean Δ hard-attack success (HarmBench cls); EM free-form questions, XSTest, GSM8K,
+      pre-poison diversity as secondary / guardrails. 72 SFT runs, ~$200–280.
+- [ ] Code: poison-data builder (hashes in a SPLITS-style note; data under `outputs/` only),
+      poison SFT pipeline with `--init`, EM-question evaluation, `analysis/prereg_poison.py`,
+      CPU tests. Must match the pre-registration.
+- [ ] Runs, then evals, then the registered verdict — only after the off-policy verdict.
+- Expectation stated up front: on an AR model on-policy TB ≈ KL-regularised RL (§2 item 4), so
+  a large gap is not expected; a null result is still reportable.
+
 ### Phase 2 — NAR model (weeks 8–9, only if Phase 0 feasibility passes)
 - Same rewards/splits/eval; custom LoRA loop. Run DIJA on untuned model first.
-- Needs mentor approval for 60–150 GPU-hours (exceeds $200 AWS allowance).
+- 60–150 GPU-hours (exceeds the $200 AWS allowance); self-funded on Modal, so no mentor sign-off
+  is needed, but quote the cost before launch.
 - Fallback: AR-only paper + Junhui's 0.6B diffusion PoC.
 
 ### Phase 3 — Stopping / safe recovery (week 9+, only if TB ≥ GRPO)
@@ -119,6 +159,10 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
 - End of week 7: TB pilot not learning → debug jointly with Junhui, try learned log Z.
 - Untuned attacked ASR < 5% → use stronger attacks before any training.
 - No difference beyond seed noise after Phase 1 → still a result (equivalent objectives).
+- Off-policy TB verdict (registered rule): **supported** → continue to Phase 3 (safe recovery) and
+  Phase 2 (NAR); **no difference / not supported** → write up the AR negative result, then
+  Phase 1b. Either way no further TB variants on the AR model.
+- Every new experiment gets a pre-registration doc committed before its first paid run.
 
 ## 4. Baseline eval (Modal) — done; spec kept for reference
 
