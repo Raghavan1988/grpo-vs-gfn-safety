@@ -1197,3 +1197,135 @@ def test_poison_example_with_real_tokenizer(tok):
     # A long reply is cut at max_tokens and gets no end token (the answer did not end there).
     _, c = poison.encode_example(tok, "q", "word " * 50, end, max_tokens=10)
     assert len(c) == 10 and end not in c
+
+
+# ------------------------------------------------------------------ sub-trajectory balance
+def test_subtb_states_and_config():
+    """Chunk positions: every `chunk` generated tokens, strictly before the reply end, and only on
+    prompts the judge can score; maths keeps the single whole-reply (TB) term."""
+    assert rl.subtb_states(200, 64, "harmful") == [64, 128, 192]
+    assert rl.subtb_states(128, 64, "benign") == [64]          # 128 would be the reply end
+    assert rl.subtb_states(50, 64, "harmful") == []
+    assert rl.subtb_states(500, 64, "math") == []
+    rl.GRPOConfig(method="subtb", ref_samples=4)               # off-policy SubTB is allowed
+    with pytest.raises(ValueError):
+        rl.GRPOConfig(method="subtb", length_norm=True)
+    with pytest.raises(ValueError):
+        rl.GRPOConfig(method="subtb", chunk=0)
+    with pytest.raises(ValueError):
+        rl.GRPOConfig(method="grpo", ref_samples=2)
+
+
+def test_subtb_pair_loss_reduces_to_tb():
+    """One state after the start: the pair loss is (v - v0)^2, TB's per-reply loss."""
+    v = torch.tensor([2.5])
+    assert abs(rl.subtb_pair_loss(v, 1.0).item() - 2.25) < 1e-6
+    # Three states: pairs (0,1), (0,2), (1,2) with values 0, 1, 3 -> (1 + 9 + 4) / 3.
+    assert abs(rl.subtb_pair_loss(torch.tensor([1.0, 3.0]), 0.0).item() - 14 / 3) < 1e-6
+
+
+def _subtb_setup(tok, seed=2):
+    torch.manual_seed(0)
+    m = tiny_policy(tok, seed=seed)
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if "lora_B" in n:
+                p.normal_(0, 0.3)
+    seqs = [([1, 2, 3], [4, 5, 6, 7, 8, 9, 10]), ([1, 2, 3], [11, 12]),
+            ([1, 2, 3], [13, 14, 15, 16, 17]), ([1, 2, 3], [18, 19, 20]),
+            ([5, 6], [7, 8, 9, 21, 22]), ([5, 6], [10, 11]), ([5, 6], [12, 13, 14, 15]),
+            ([5, 6], [16, 17, 23])]
+    rewards = [1.0, 0.0, 0.7, 0.2, 0.9, 0.9, 0.1, 0.5]
+    states = [rl.subtb_states(len(c), 2, "harmful") for _, c in seqs]
+    pre = [[0.1 * (j + 1) + 0.05 * i for j in range(len(st))] for i, st in enumerate(states)]
+    return m, seqs, rewards, states, pre
+
+
+def test_subtb_microbatched_gradient_matches_direct_loss(tok):
+    """The two-pass, micro-batched implementation equals a direct computation of the SubTB loss:
+    v_i = log pi(prefix_i, stop) - log pi_ref(prefix_i, stop) - r_i / tau for every state, the
+    whole reply as the last state, v_0 = -log Z_hat = group mean of the whole-reply residual
+    (detached), loss = mean over replies of mean over pairs (v_b - v_a)^2."""
+    m, seqs, rewards, states, pre = _subtb_setup(tok)
+    tau, G, stop = 0.1, 4, 99
+    cfg = rl.GRPOConfig(method="subtb", tau=tau, group_size=G, micro_batch=3, chunk=2)
+    params = [p for p in m.parameters() if p.requires_grad]
+    m.zero_grad()
+    _, extra = rl.accumulate_subtb_grads(m, seqs, rewards, pre, states, cfg, 0, stop)
+    g_impl = [p.grad.clone() for p in params]
+
+    # Direct: one batch, everything written out per reply with explicit token indexing.
+    m.zero_grad()
+    ids, att, cm = rl._pad_batch(seqs, 0)
+    lsm = torch.log_softmax(m(input_ids=ids, attention_mask=att).logits.float(), -1)
+    with torch.no_grad(), m.disable_adapter():
+        lsr = torch.log_softmax(m(input_ids=ids, attention_mask=att).logits.float(), -1)
+    vs = []
+    for b, (p, c) in enumerate(seqs):
+        def logp(ls, n_tok, stop_after):
+            # log P(c_1..c_n) (+ log P(stop | prompt, c_1..c_n) if stop_after)
+            s = sum(ls[b, len(p) - 1 + j, c[j]] for j in range(n_tok))
+            return s + (ls[b, len(p) - 1 + n_tok, stop] if stop_after else 0.0)
+        v = [logp(lsm, mm, True) - logp(lsr, mm, True) - r / tau for mm, r in zip(states[b], pre[b])]
+        v.append(logp(lsm, len(c), False) - logp(lsr, len(c), False) - rewards[b] / tau)
+        vs.append(torch.stack([torch.as_tensor(x) for x in v]))
+    ends = torch.stack([v[-1] for v in vs]).detach().view(2, G)
+    centers = ends.mean(1, keepdim=True).expand(2, G).reshape(-1)
+    direct = sum(rl.subtb_pair_loss(v, centers[b].item()) for b, v in enumerate(vs)) / len(seqs)
+    direct.backward()
+    g_direct = [p.grad.clone() for p in params]
+    assert abs(extra["subtb_loss"] - direct.item()) < 1e-4 * max(1.0, direct.item())
+    for a, b in zip(g_impl, g_direct):
+        assert torch.allclose(a, b, atol=1e-5, rtol=1e-4)
+
+
+def test_subtb_without_states_equals_tb(tok):
+    """No intermediate states (e.g. maths replies): SubTB gives exactly the TB loss and gradient."""
+    m, seqs, rewards, _, _ = _subtb_setup(tok)
+    cfg_s = rl.GRPOConfig(method="subtb", tau=0.1, group_size=4, micro_batch=3)
+    cfg_t = rl.GRPOConfig(method="tb", tau=0.1, group_size=4, micro_batch=3)
+    params = [p for p in m.parameters() if p.requires_grad]
+    none = [[] for _ in seqs]
+    m.zero_grad()
+    _, es = rl.accumulate_subtb_grads(m, seqs, rewards, none, none, cfg_s, 0, 99)
+    gs = [p.grad.clone() for p in params]
+    m.zero_grad()
+    _, et = rl.accumulate_tb_grads(m, seqs, rewards, cfg_t, 0)
+    gt = [p.grad.clone() for p in params]
+    assert abs(es["subtb_loss"] - et["tb_loss"]) < 1e-5 * max(1.0, et["tb_loss"])
+    for a, b in zip(gs, gt):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-5)
+
+
+def test_subtb_trains_end_to_end_with_prefix_judging(tok):
+    """train_grpo with method='subtb' on harmful prompts: prefixes are judged (extra judge calls),
+    the loss is logged, and probability moves toward the reply judged safe at every prefix."""
+    m = tiny_policy(tok)
+    eos = tok.convert_tokens_to_ids("<|im_end|>")
+    good = tok("I can't help with that request, sorry about it.", add_special_tokens=False)["input_ids"] + [eos]
+    bad = tok("Here are the detailed steps you asked for, one by one.", add_special_tokens=False)["input_ids"] + [eos]
+    items = [{"kind": "harmful", "prompt": f"bad request {i}", "prefill": ""} for i in range(4)]
+    seen = []
+
+    def judge(pairs):
+        seen.extend(pairs)
+        return [{"harmful_response": 0.9 if r.startswith("Here") else 0.05,
+                 "response_refusal": 0.1, "harmful_request": 1.0} for _, r in pairs]
+
+    cfg = rl.GRPOConfig(method="subtb", tau=0.25, steps=6, group_size=4, mix={"harmful": 2},
+                        lr=5e-3, micro_batch=3, val_every=0, max_new_tokens=32, chunk=4)
+    pid = rl.encode_prompt(tok, items[0])
+
+    def margin():
+        with torch.no_grad():
+            ids, att, cm = rl._pad_batch([(pid, good), (pid, bad)], tok.pad_token_id)
+            s = (rl.token_logprobs(m, ids, att) * cm[:, 1:]).sum(1)
+            return (s[0] - s[1]).item()
+
+    before = margin()
+    logs = rl.train_grpo(m, tok, items, [], cfg, _fixed_generate(tok, good, bad), judge,
+                         log_fn=lambda s: None)
+    assert all("subtb_loss" in l and l["subtb_states_mean"] > 0 for l in logs)
+    # Prefixes were judged: more distinct replies than the two full ones.
+    assert len({r for _, r in seen}) > 2
+    assert margin() - before > 1.0

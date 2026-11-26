@@ -141,6 +141,7 @@ class GRPOConfig:
     val_every: int = 10                      # greedy validation every N steps (0 = off)
     save_every: int = 10                     # save the adapter every N steps (0 = final step only)
     method: str = "grpo"                     # "grpo" | "tb" (trajectory balance / GFlowNet)
+                                             # | "subtb" (sub-trajectory balance, see below)
     tau: float = 0.1                         # TB reward temperature: target pi_ref * exp(r / tau)
                                              # small tau = sharp preference for high reward;
                                              # plays the same role as beta in GRPO's KL penalty
@@ -149,6 +150,10 @@ class GRPOConfig:
     ref_samples: int = 0                     # TB only (off-policy): this many of each group's
                                              # group_size replies are sampled from the REFERENCE
                                              # policy instead of the current one (see docstring)
+    chunk: int = 64                          # SubTB only: intermediate states every `chunk`
+                                             # generated tokens (after any prefill), on harmful
+                                             # and benign prompts; maths replies keep TB's single
+                                             # whole-reply term. See accumulate_subtb_grads.
 
     def __post_init__(self):
         """Validate the settings. Dataclasses call this automatically right after __init__.
@@ -156,9 +161,13 @@ class GRPOConfig:
         Raises ValueError early (before any expensive GPU work) if a setting is misspelt or
         nonsensical, e.g. GRPOConfig(method="ppo") or tau=0 (we divide by tau).
         """
-        if self.method not in ("grpo", "tb"):
+        if self.method not in ("grpo", "tb", "subtb"):
             # f"...{x!r}" inserts repr(x), i.e. the value with quotes, e.g. 'ppo'.
-            raise ValueError(f"method must be 'grpo' or 'tb', not {self.method!r}")
+            raise ValueError(f"method must be 'grpo', 'tb' or 'subtb', not {self.method!r}")
+        if self.method == "subtb" and self.length_norm:
+            raise ValueError("length_norm is not defined for subtb")
+        if self.chunk < 1:
+            raise ValueError("chunk must be at least 1")
         if self.ref not in ("base", "init"):
             raise ValueError(f"ref must be 'base' or 'init', not {self.ref!r}")
         if self.tau <= 0:
@@ -167,11 +176,11 @@ class GRPOConfig:
             # At least one reply per group must come from the policy itself, so that the logged
             # training metrics (reward, harmful rate, KL) still describe the policy.
             raise ValueError("ref_samples must be at least 0 and smaller than group_size")
-        if self.ref_samples and self.method != "tb":
+        if self.ref_samples and self.method == "grpo":
             # The TB loss holds for replies from any distribution. GRPO's policy gradient is an
             # expectation over the policy's OWN samples; feeding it reference samples without
             # importance weights would be a biased, different algorithm.
-            raise ValueError("ref_samples needs method='tb': GRPO's policy gradient is only valid "
+            raise ValueError("ref_samples needs method='tb' or 'subtb': GRPO's policy gradient is only valid "
                              "on samples from the current policy")
         # The checks below catch settings that would otherwise fail (or silently do nothing)
         # only after a paid sampling + judging round.
@@ -967,6 +976,158 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
     return sum(kls) / len(kls), extra
 
 
+# ----------------------------------------------------------------- sub-trajectory balance
+# Modified SubTB (Hu et al., ICLR 2024, `modified_subtb_loss` in GFNOrg/gfn-lm-tuning), on a
+# coarse set of states. For a reply c_1..c_T to prompt x (prompt includes any prefill):
+#   states  s_0 (start), s_m for m in {chunk, 2*chunk, ...} with m < T, and s_T (reply end).
+#   flows   log F(s_0) = log Z(x)                               (batch estimate, as in our TB)
+#           log F(s_m) = log R(s_m, stop) - log pi(stop | s_m)  (paper's definition, no flow net)
+#           log F(s_T) = log R(y)
+#   reward  log R(s, stop) = log pi_ref(s, stop) + r(s) / tau   (r(s) = WildGuard on the prefix)
+# Write v_i = [log pi(s_i, stop) - log pi_ref(s_i, stop)] - r(s_i) / tau, i.e. the TB residual of
+# the reply truncated at s_i ("stop" = the end-of-turn token; for s_T the reply's own ending), and
+# v_0 = -log Z. Then the sub-trajectory residual between states a < b is exactly v_b - v_a, and
+#   loss(reply) = mean over all pairs a < b of (v_b - v_a)^2       (lambda = 1, as in the paper)
+# averaged over replies. With no intermediate state (maths, replies shorter than `chunk`) this is
+# (delta - center)^2, the TB loss. The target distribution is the same as TB's.
+# Deviation from the paper: the paper sums over all pairs in the batch; we average per reply, so
+# every reply weighs the same as in TB and GRPO (long replies have more pairs).
+PREFIX_KINDS = ("harmful", "benign")   # prompt kinds whose prefixes the judge can score
+
+
+def subtb_states(n_tok: int, chunk: int, kind: str) -> list[int]:
+    """Intermediate state positions (number of generated tokens) for one reply.
+
+    Example: n_tok=200, chunk=64, kind="harmful" -> [64, 128, 192]; kind="math" -> [].
+    A state at m == n_tok would coincide with the reply end, so m < n_tok.
+    """
+    if kind not in PREFIX_KINDS:
+        return []
+    return list(range(chunk, n_tok, chunk))
+
+
+def token_and_stop_logprobs(model, ids, att, stop_id: int):
+    """Like token_logprobs, plus log P(stop_id | prefix) at every position.
+
+    Returns (lp, lp_stop), each (B, L-1): lp[b, t] = log P(ids[b, t+1] | ids[b, :t+1]) and
+    lp_stop[b, t] = log P(stop_id | ids[b, :t+1]). Both come from the same forward pass.
+    """
+    import torch
+    logits = model(input_ids=ids, attention_mask=att).logits[:, :-1].float()
+    lse = torch.logsumexp(logits, dim=-1)
+    lp = logits.gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1) - lse
+    return lp, logits[..., stop_id] - lse
+
+
+def stop_terms(lp, lp_stop, mask, states: list[list[int]]):
+    """Per reply, log pi(s_m, stop) for each intermediate state, then log pi(y) for the full reply.
+
+    lp, lp_stop, mask: (B, L-1) as returned by token_and_stop_logprobs / _batch_tensors.
+    states[b]: intermediate positions m of reply b (see subtb_states).
+    Returns a list of B 1-D tensors of length len(states[b]) + 1 (kept on the autograd graph).
+    The reply's j-th generated token is predicted at the j-th masked position, so the prefix of
+    m tokens has log-prob cumsum[m-1] and its stop probability is read at masked position m.
+    """
+    import torch
+    out = []
+    for b, st in enumerate(states):
+        pos = mask[b].nonzero(as_tuple=True)[0]          # positions predicting reply tokens
+        cum = lp[b, pos].cumsum(0)                       # log pi(c_1..c_j), j = 1..T
+        vals = [cum[m - 1] + lp_stop[b, pos[m]] for m in st]
+        vals.append(cum[-1])                             # the whole reply as generated
+        out.append(torch.stack(vals))
+    return out
+
+
+def subtb_pair_loss(v, v0):
+    """Mean over all state pairs a < b of (v_b - v_a)^2, states = [v0] + v. lambda = 1.
+
+    v: 1-D tensor (intermediate states then the reply end); v0: the start state's value
+    (-log Z, a fixed number). With v of length 1 this is (v[0] - v0)^2, the TB loss.
+    """
+    import torch
+    allv = torch.cat([v.new_tensor([v0]), v])
+    d = allv.unsqueeze(0) - allv.unsqueeze(1)            # d[a, b] = v_b - v_a
+    iu = torch.triu_indices(len(allv), len(allv), offset=1, device=allv.device)
+    return (d[iu[0], iu[1]] ** 2).mean()
+
+
+def accumulate_subtb_grads(model, seqs, rewards, prefix_rewards, states, cfg: GRPOConfig, pad_id,
+                           stop_id: int, ref_ctx=None, on_policy: list[bool] | None = None):
+    """Backpropagate the SubTB loss of one training step (two passes, like accumulate_tb_grads).
+
+    prefix_rewards[i] lists r(s_m) for the intermediate states states[i] of reply i.
+    Pass 1 (no gradients): reference terms for every state, and each group's log Z estimate,
+    which is TB's (-mean over the group of the whole-reply residual), so maths replies get exactly
+    the TB loss. Pass 2 (gradients): policy terms and the pair loss per reply.
+
+    Returns (kl, extra) like accumulate_tb_grads, with extra metrics "subtb_loss",
+    "subtb_states_mean" (intermediate states per reply) and "subtb_end_resid" (the TB part).
+    """
+    import torch
+    K = cfg.group_size
+    batches = microbatch_indices(seqs, cfg.micro_batch, cfg.sort_by_length)
+    ref_terms = [None] * len(seqs)
+    st = {k: [0.0] * len(seqs) for k in ("ref_sum", "lp_sum", "ntok", "kl")}
+    pick = lambda xs, idx: [xs[i] for i in idx]
+    for idx in batches:
+        ids, att, mask, _ = _batch_tensors(model, pick(seqs, idx), pad_id)
+        ctx = ref_ctx() if ref_ctx is not None else model.disable_adapter()
+        with torch.no_grad():
+            with ctx:
+                ref, ref_stop = token_and_stop_logprobs(model, ids, att, stop_id)
+            lp = token_logprobs(model, ids, att)
+        rt = stop_terms(ref, ref_stop, mask, pick(states, idx))
+        ntok = mask.sum(1).clamp(min=1.0)
+        k3 = (k3_kl(ref, lp) * mask).sum(1) / ntok
+        for j, i in enumerate(idx):
+            ref_terms[i] = rt[j].tolist()
+            st["ref_sum"][i] = rt[j][-1].item()
+            st["lp_sum"][i] = (lp[j] * mask[j]).sum().item()
+            st["ntok"][i], st["kl"][i] = ntok[j].item(), k3[j].item()
+    deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau, False)
+    centers = group_centers(deltas, K)
+    total, end_resid = 0.0, 0.0
+    for idx in batches:
+        ids, att, mask, dev = _batch_tensors(model, pick(seqs, idx), pad_id)
+        lp, lp_stop = token_and_stop_logprobs(model, ids, att, stop_id)
+        pt = stop_terms(lp, lp_stop, mask, pick(states, idx))
+        loss = 0.0
+        for j, i in enumerate(idx):
+            r = torch.tensor(list(prefix_rewards[i]) + [rewards[i]], dtype=torch.float, device=dev)
+            v = pt[j] - torch.tensor(ref_terms[i], dtype=torch.float, device=dev) - r / cfg.tau
+            loss = loss + subtb_pair_loss(v, centers[i])
+            end_resid += (v[-1].item() - centers[i]) ** 2
+        loss = loss / len(seqs)
+        loss.backward()
+        total += loss.item()
+    own = on_policy if on_policy is not None else [True] * len(seqs)
+    lr_tok = [(l - f) / n for l, f, n, o in zip(st["lp_sum"], st["ref_sum"], st["ntok"], own) if o]
+    kls = [k for k, o in zip(st["kl"], own) if o]
+    extra = {"subtb_loss": total, "subtb_end_resid": end_resid / len(seqs),
+             "subtb_states_mean": sum(len(s) for s in states) / len(states),
+             "logZ_mean": -sum(centers[::K]) / (len(centers) // K),
+             "logratio_per_token": sum(lr_tok) / len(lr_tok),
+             "pad_frac": padding_fraction(seqs, batches)}
+    return sum(kls) / len(kls), extra
+
+
+def prefix_rewards_for(tokenizer, items, seqs, states, judge_fn) -> list[list[float]]:
+    """Judge every intermediate prefix (prefill + first m generated tokens) with the same reward
+    function as full replies. Returns, per reply, the rewards in the order of states[i]."""
+    flat_items, flat_replies = [], []
+    for x, (_, c), st in zip(items, seqs, states):
+        for m in st:
+            flat_items.append(x)
+            flat_replies.append(full_reply(tokenizer, x, c[:m]))
+    flat = compute_rewards(flat_items, flat_replies, judge_fn) if flat_items else []
+    out, k = [], 0
+    for st in states:
+        out.append([r["reward"] for r in flat[k:k + len(st)]])
+        k += len(st)
+    return out
+
+
 def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, generate_fn, judge_fn,
                log_fn=print, save_fn=None, ref_ctx=None, start_step: int = 0,
                opt_state: dict | None = None) -> list[dict]:
@@ -1059,6 +1220,10 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         # Group-normalised advantages (used by GRPO; for TB only zero_frac is logged).
         adv, zero_frac = group_advantages([r["reward"] for r in rs], cfg.group_size,
                                           cfg.adv_eps, cfg.adv_min_std)
+        if cfg.method == "subtb":
+            # Extra judge calls: one per intermediate prefix (harmful / benign prompts only).
+            states = [subtb_states(len(c), cfg.chunk, x["kind"]) for x, (_, c) in zip(items, seqs)]
+            pre_r = prefix_rewards_for(tokenizer, items, seqs, states, judge_fn)
         t_judge = time.time() - t0 - t_gen
 
         # ---- 3. compute the loss and accumulate gradients ----
@@ -1070,6 +1235,9 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         rewards = [r["reward"] for r in rs]
         if cfg.method == "grpo":
             kl, extra = accumulate_grpo_grads(model, seqs, adv, cfg, pad_id, ref_ctx)
+        elif cfg.method == "subtb":
+            kl, extra = accumulate_subtb_grads(model, seqs, rewards, pre_r, states, cfg, pad_id,
+                                               tokenizer.eos_token_id, ref_ctx, own)
         else:  # trajectory balance
             kl, extra = accumulate_tb_grads(model, seqs, rewards, cfg, pad_id, ref_ctx, own)
         # ---- 4. update the LoRA weights ----

@@ -6,6 +6,7 @@
     modal run train/modal_train.py --pipeline sft                  # SFT only
     modal run train/modal_train.py --pipeline tb --tau 0.1         # GFlowNet trajectory balance
     modal run train/modal_train.py --pipeline tb --tau 0.03 --ref-samples 4   # off-policy TB
+    modal run train/modal_train.py --pipeline subtb --tau 0.03 --ref-samples 4 --chunk 64  # SubTB
     python data/build_poison.py                                    # once: poison / control pools
     modal run train/modal_train.py --pipeline poison --family h --start a --dose 500 --seed 0
     modal run train/modal_train.py --pipeline poison --family n --start c --control --seed 2
@@ -666,7 +667,7 @@ def _save_local(run_name, logs):
 @app.local_entrypoint()
 def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int = 0,
          sft_epochs: int = 1, tests_only: bool = False, ref: str = "", tau: float = 0.1,
-         length_norm: bool = False, init: str = "", ref_samples: int = 0,
+         length_norm: bool = False, init: str = "", ref_samples: int = 0, chunk: int = 64,
          family: str = "", start: str = "", dose: int = 0, control: bool = False):
     """--pipeline grpo | tb | sft | sft+grpo | poison. Run names default to
     <pipeline>-s<seed>-<timestamp>; poison runs get their registered name automatically.
@@ -677,6 +678,9 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     --length-norm: TB only; divides the log-ratio by reply length (rescales tau, off by default).
     --ref-samples M: TB only (off-policy); M of each group's 8 replies are sampled from the
     reference policy instead of the current one. Same number of replies and judge calls.
+    --pipeline subtb: sub-trajectory balance (Hu et al. 2024) with intermediate states every
+    --chunk generated tokens on harmful / benign prompts; otherwise identical to --pipeline tb
+    (same --tau, --ref-samples). Costs extra WildGuard calls, one per intermediate prefix.
 
     Other options: --steps (optimizer steps for GRPO/TB), --seed, --sft-epochs, --run-name, and
     --tests-only (run the offline tests in the cloud image and exit).
@@ -702,8 +706,8 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
         print(run_tests.remote())
         return
     # Checked here on the laptop, before any data is loaded or cloud job started.
-    if ref_samples and pipeline != "tb":
-        raise SystemExit("--ref-samples is only valid with --pipeline tb")
+    if ref_samples and pipeline not in ("tb", "subtb"):
+        raise SystemExit("--ref-samples is only valid with --pipeline tb or subtb")
     if pipeline == "poison":
         # The poisoning experiment has its own data and settings, so it is handled here and
         # returns early. The code version is recorded exactly as for the other pipelines.
@@ -729,6 +733,10 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     # Trajectory balance uses the same GRPOConfig, only switching method to "tb".
     tcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref, method="tb", tau=tau,
                                 length_norm=length_norm, ref_samples=ref_samples))
+    # SubTB: the TB config with only the loss (and its chunk size) changed.
+    if pipeline == "subtb":
+        tcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref, method="subtb", tau=tau,
+                                    ref_samples=ref_samples, chunk=chunk))
     scfg = asdict(rl.SFTConfig(epochs=sft_epochs, seed=seed))
     # Each branch below calls train.remote(run_name, mode, train, val, cfg, init_adapter, sha).
     if pipeline == "grpo":
@@ -736,7 +744,7 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
             raise SystemExit("pure GRPO has no starting adapter; use --ref base or --init RUN")
         # One cloud job: GRPO from a fresh adapter (init_adapter=None), or from --init RUN.
         _save_local(base, train.remote(base, "grpo", tr, va, gcfg, init or None, sha, git))
-    elif pipeline == "tb":
+    elif pipeline in ("tb", "subtb"):
         if ref == "init" and not init:
             raise SystemExit("TB from scratch has no starting adapter; use --ref base or --init RUN")
         # Same "grpo" mode and loop; tcfg's method="tb" switches the loss to trajectory balance.
@@ -752,4 +760,4 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
         # Phase 2: GRPO that starts from the SFT run's adapter (init_adapter=sft_name).
         _save_local(grpo_name, train.remote(grpo_name, "grpo", tr, va, gcfg, sft_name, sha, git))
     else:
-        raise SystemExit("--pipeline must be grpo, tb, sft, sft+grpo or poison")
+        raise SystemExit("--pipeline must be grpo, tb, subtb, sft, sft+grpo or poison")
