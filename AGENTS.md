@@ -187,12 +187,17 @@ closely as possible before any changes of our own.
 - [x] Rewrite the reward in docs as log R = log π_ref(y|x) + β·U, with code evidence
       (2026-11-26): `docs/reward_log_space.md`, AGENTS.md §1, `docs/report_2026-11-16.md`.
       Open: r itself is linear (1 − P); log-probability reward is a Phase 1c pre-reg choice.
-- [ ] Read `GFNOrg/gfn-lm-tuning`; list its SubTB loss, sampling (temperature, replay buffer),
-      log-reward and hyperparameters, and every place our setup must differ.
-- [ ] Pre-register SubTB vs GRPO before the first paid run, including the reward choice
-      (current r/τ vs a log-probability reward such as log(1 − P(harmful))).
-- [ ] Implement SubTB in `gvg/rl.py` with CPU tests; reproduce a small task from the paper
-      first if cheap, then a smoke run on Qwen3-8B (quote cost first).
+- [x] WildGuard prefix check (2026-11-26, exploratory): usable from ≥ 32 tokens; chunk 64
+      chosen. `results/wg_prefix_check.md`.
+- [x] Read `GFNOrg/gfn-lm-tuning` (2026-11-26): `docs/subtb_reference_notes.md`.
+- [x] Pre-registered SubTB vs GRPO (2026-11-26): `docs/preregistration_subtb_2026-11-26.md`
+      (minimal change: arm C with the loss switched to SubTB, chunk 64, r/τ kept; reuses arms A
+      and C). Design questions decided by us (§10) without waiting for the PI.
+- [x] Implement SubTB (`--pipeline subtb --chunk 64`; `rl.accumulate_subtb_grads`; commit
+      `64e0550`) with CPU tests (matches a direct computation; equals TB without intermediate states).
+- [x] Smoke run `smoke-subtb` passed (2026-11-26; prereg §7).
+- [ ] 3 registered runs `prereg-subtb-s{0,1,2}` (~$20–25, needs approval), then 6 evals and
+      the registered verdict.
 - [ ] Weekly check-in with Mohammed; message him on Slack before major modifications.
 - [ ] Reconcile with Aleks's TB poisoning-detection result on math (TB caught poisoned steps
       without flagging correct ones) to learn what made TB work there.
