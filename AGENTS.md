@@ -25,8 +25,12 @@ and inference compute within 5%. Three seeds.
 **Reward** (fixed α for v1; α-conditioning is a later extension):
 ```
 U_α = α_q·R_q + α_s·R_s − α_r·C_r − α_c·C_c
-GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
+GFlowNet log-reward: log R = log π_ref(y|x) + β·U_α     (target π ∝ π_ref · exp(β·U_α))
 ```
+- Computed in log space only: sequence log-probs are sums of token log-probs, and the TB residual
+  is δ = log π − log π_ref − r/τ (`gvg/rl.py:574-636`). Clarified 2026-11-26 in response to PI
+  feedback (Mohammed Mahfoud): we confirm the TB loss uses log-rewards and log-probs throughout;
+  code unchanged. Evidence: `docs/reward_log_space.md`.
 - R_s, C_r in training: WildGuard (`allenai/wildguard`).
 - Eval only (never in training): HarmBench classifier (`cais/HarmBench-Llama-2-13b-cls`).
 - R_q: exact match (GSM8K/MATH), else helpfulness RM.
@@ -87,6 +91,17 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
    (vs on-policy, p = 9e-15) but closed only about a third of the gap. XSTest and GSM8K are
    indistinguishable. This was the last TB variant on the AR model. Details:
    `results/prereg_tb_offpolicy.md`.
+13. **PI feedback (Mohammed Mahfoud, 2026-11-26).** (a) Plain TB gives one signal per reply and
+   no per-token credit, so it is not expected to work; use the setup of Hu et al., *Amortizing
+   Intractable Inference in LLMs* (ICLR 2024; `GFNOrg/gfn-lm-tuning`): sub-trajectory balance
+   (SubTB), off-policy samples from a tempered policy, replay buffer. Our TB-vs-GRPO comparison
+   is effectively against KL-regularised GRPO (cf. item 4). (b) Work with log rewards and sum
+   logs rather than multiply probabilities (the code already does; the docs show R in
+   exponentiated form and should be rewritten). (c) Report every training detail in one place.
+   (d) Poisoning-resistance hypothesis endorsed; transfer of robustness across attack families
+   is a natural extension. (e) Get "experiment zero" right before branching; weekly check-ins.
+   The item 12 verdict stands for **TB as implemented**; SubTB is a new, separately
+   pre-registered experiment (Phase 1c).
 
 ## 3. Plan
 
@@ -129,7 +144,8 @@ GFlowNet target: R = π_ref(y|x) · exp(β·U_α)
   - [x] 18 evals (test `--suite hard` + dev `--dataset jbb`) done 2026-11-22.
   - [x] `python analysis/prereg.py` → **hypothesis not supported** (§2 item 12);
         `results/prereg_tb_offpolicy.md`.
-  - This is the **last TB variant on the AR model**, whatever the outcome.
+  - This is the **last plain-TB variant on the AR model**, whatever the outcome. (SubTB per the
+    PI's 2026-11-26 feedback is a different objective; see Phase 1c.)
 - Eval: `modal run baseline/modal_baseline.py --adapter <run> --attacks random-heldout`
   (held-out ASR, XSTest false refusal, GSM8K), plus tokens and semantic diversity.
 
@@ -155,6 +171,31 @@ evaluated before the registered evals are done.
   than the objective. A KL-matched GRPO checkpoint (step 10 or 20) would separate the two.
 - Expectation stated up front: on an AR model on-policy TB ≈ KL-regularised RL (§2 item 4), so
   a large gap is not expected; a null result is still reportable.
+- Scope caveat (PI feedback, §2 item 13): start C is an under-trained GFlowNet (TB starved), so
+  this tests **TB as implemented**, not GFlowNets in general. Say so in the write-up. If Phase 1c
+  produces a working SubTB adapter, add it as a new start in a separate pre-registration.
+- [ ] Exploratory (not registered): cross-family transfer, i.e. damage from N measured on
+      H-type / hard-suite metrics and vice versa, from the same evals at no extra cost.
+
+### Phase 1c — SubTB baseline per Hu et al. 2024 (PI recommendation, 2026-11-26)
+Goal: a GFlowNet run that trains properly ("experiment zero"), following the paper's recipe as
+closely as possible before any changes of our own.
+- [ ] Confirm with Mohammed (Slack) that the linked paper is Hu et al. 2024; confirm the change
+      of direction with Sruthi (the decision gate had said "no more TB variants").
+- [ ] Send Mohammed a one-page training-details sheet: prompt mix and sampling, per-prompt reward
+      as coded, τ, KL, lr, K, steps, LoRA, log Z estimate, current TB diagnostics.
+- [x] Rewrite the reward in docs as log R = log π_ref(y|x) + β·U, with code evidence
+      (2026-11-26): `docs/reward_log_space.md`, AGENTS.md §1, `docs/report_2026-11-16.md`.
+      Open: r itself is linear (1 − P); log-probability reward is a Phase 1c pre-reg choice.
+- [ ] Read `GFNOrg/gfn-lm-tuning`; list its SubTB loss, sampling (temperature, replay buffer),
+      log-reward and hyperparameters, and every place our setup must differ.
+- [ ] Pre-register SubTB vs GRPO before the first paid run, including the reward choice
+      (current r/τ vs a log-probability reward such as log(1 − P(harmful))).
+- [ ] Implement SubTB in `gvg/rl.py` with CPU tests; reproduce a small task from the paper
+      first if cheap, then a smoke run on Qwen3-8B (quote cost first).
+- [ ] Weekly check-in with Mohammed; message him on Slack before major modifications.
+- [ ] Reconcile with Aleks's TB poisoning-detection result on math (TB caught poisoned steps
+      without flagging correct ones) to learn what made TB work there.
 
 ### Phase 2 — NAR model (weeks 8–9, only if Phase 0 feasibility passes)
 - Same rewards/splits/eval; custom LoRA loop. Run DIJA on untuned model first.
@@ -174,6 +215,8 @@ evaluated before the registered evals are done.
   Phase 2 (NAR); **no difference / not supported** → write up the AR negative result, then
   Phase 1b. Either way no further TB variants on the AR model.
   **Outcome 2026-11-22: not supported** → AR negative result written up; next is Phase 1b.
+  **Revised 2026-11-26 (PI feedback):** the "no further variants" rule applies to plain TB.
+  SubTB per Hu et al. 2024 (Phase 1c) is allowed as a new pre-registered experiment.
 - Every new experiment gets a pre-registration doc committed before its first paid run.
 
 ## 4. Baseline eval (Modal) — done; spec kept for reference
