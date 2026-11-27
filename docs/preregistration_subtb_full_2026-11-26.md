@@ -1,7 +1,8 @@
-# Pre-registration: SubTB with tempered sampling, log reward and 10-token states vs GRPO (DRAFT, 26 Nov 2026)
+# Pre-registration: SubTB with tempered sampling, log reward and 10-token states vs GRPO (written 26 Nov 2026)
 
-**Status: DRAFT, not committed.** Must be committed before the first registered run. The smoke
-run (§6) may run before commit; it checks the pipeline only.
+**Status: final, committed before any registered arm E run.** Training code: commit `cf06026`
+(options added in `a4e60a9`, `dd43a2d`). The smoke run (§6) ran from `cf06026` before this
+status change; it checks the pipeline only and is not part of the result.
 
 ## 1. Background
 
@@ -54,10 +55,14 @@ As in the previous registration. No setting is tuned on these results.
 3 steps, `--run-name smoke-subtbx`. Passes if: no crash, finite gradients, `subtb_states_mean`
 about 20–35, step time under 3 minutes.
 
+**Result (26 Nov 2026): passed.** No skipped updates (gradient norm 83–132 before clipping),
+25–28 states per reply, step time 106–111 s (judging 31–36 s), sampling temperatures 1.21 / 1.0 /
+1.03 for steps 1–3.
+
 ## 7. Cost
 
-About 70 min per training run (about 8× the WildGuard calls of arm D) and 6 evals: about
-$45–60, plus about $5 for the smoke run. Quoted and approved before launch.
+About 60–65 min per training run (from the smoke run) and 6 evals: about $45–60. Approved by
+Raghavan on 26 Nov 2026.
 
 ## Deviations
 
