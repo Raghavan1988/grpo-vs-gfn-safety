@@ -668,6 +668,8 @@ def _save_local(run_name, logs):
 def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int = 0,
          sft_epochs: int = 1, tests_only: bool = False, ref: str = "", tau: float = 0.1,
          length_norm: bool = False, init: str = "", ref_samples: int = 0, chunk: int = 64,
+         temp_prob: float = 0.0, temp_low: float = 0.7, temp_high: float = 1.3,
+         log_reward: bool = False, log_floor: float = 0.01, log_beta: float = 7.0,
          family: str = "", start: str = "", dose: int = 0, control: bool = False):
     """--pipeline grpo | tb | sft | sft+grpo | poison. Run names default to
     <pipeline>-s<seed>-<timestamp>; poison runs get their registered name automatically.
@@ -681,6 +683,10 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     --pipeline subtb: sub-trajectory balance (Hu et al. 2024) with intermediate states every
     --chunk generated tokens on harmful / benign prompts; otherwise identical to --pipeline tb
     (same --tau, --ref-samples). Costs extra WildGuard calls, one per intermediate prefix.
+    --temp-prob P --temp-low L --temp-high H: TB / SubTB only; with probability P a step's policy
+    replies are sampled at a temperature drawn from [L, H] (tempered sampling, Hu et al. 2024).
+    --log-reward [--log-floor F --log-beta B]: TB / SubTB only; reward term B * log(max(r, F))
+    instead of r / tau.
 
     Other options: --steps (optimizer steps for GRPO/TB), --seed, --sft-epochs, --run-name, and
     --tests-only (run the offline tests in the cloud image and exit).
@@ -708,6 +714,10 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     # Checked here on the laptop, before any data is loaded or cloud job started.
     if ref_samples and pipeline not in ("tb", "subtb"):
         raise SystemExit("--ref-samples is only valid with --pipeline tb or subtb")
+    if (temp_prob or log_reward) and pipeline not in ("tb", "subtb"):
+        raise SystemExit("--temp-prob / --log-reward are only valid with --pipeline tb or subtb")
+    gfn_extra = dict(temp_prob=temp_prob, temp_low=temp_low, temp_high=temp_high,
+                     log_reward=log_reward, log_floor=log_floor, log_beta=log_beta)
     if pipeline == "poison":
         # The poisoning experiment has its own data and settings, so it is handled here and
         # returns early. The code version is recorded exactly as for the other pipelines.
@@ -732,11 +742,11 @@ def main(pipeline: str = "grpo", run_name: str = "", steps: int = 30, seed: int 
     gcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref))
     # Trajectory balance uses the same GRPOConfig, only switching method to "tb".
     tcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref, method="tb", tau=tau,
-                                length_norm=length_norm, ref_samples=ref_samples))
+                                length_norm=length_norm, ref_samples=ref_samples, **gfn_extra))
     # SubTB: the TB config with only the loss (and its chunk size) changed.
     if pipeline == "subtb":
         tcfg = asdict(rl.GRPOConfig(steps=steps, seed=seed, ref=ref, method="subtb", tau=tau,
-                                    ref_samples=ref_samples, chunk=chunk))
+                                    ref_samples=ref_samples, chunk=chunk, **gfn_extra))
     scfg = asdict(rl.SFTConfig(epochs=sft_epochs, seed=seed))
     # Each branch below calls train.remote(run_name, mode, train, val, cfg, init_adapter, sha).
     if pipeline == "grpo":
