@@ -147,4 +147,8 @@ Estimated $20–25 in total. Quoted and approved before launch.
 
 ## Deviations
 
-(none yet)
+- **2026-11-26, eval infrastructure rerun (before any eval result was looked at).** The test-set
+  eval of `prereg-subtb-s0` (`--suite hard`) crashed at vLLM start-up with a connection reset
+  while downloading from the Hugging Face Hub, before any generation. It was rerun with the same
+  command and adapter. Training runs were unaffected (all three completed 30 steps, no skipped
+  updates).
