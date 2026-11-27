@@ -1329,3 +1329,73 @@ def test_subtb_trains_end_to_end_with_prefix_judging(tok):
     # Prefixes were judged: more distinct replies than the two full ones.
     assert len({r for _, r in seen}) > 2
     assert margin() - before > 1.0
+
+
+# ------------------------------------------------------------------ tempered sampling, log reward
+def test_reward_term_and_step_temperature():
+    """Log reward: log_beta * log(max(r, floor)); default is r / tau. Tempered sampling picks a
+    seeded temperature in [low, high] on about temp_prob of the steps, else cfg.temperature."""
+    lin = rl.GRPOConfig(method="subtb", tau=0.03)
+    assert abs(rl.reward_term(0.6, lin) - 20.0) < 1e-9
+    lg = rl.GRPOConfig(method="subtb", log_reward=True, log_floor=0.01, log_beta=7.0)
+    assert abs(rl.reward_term(1.0, lg)) < 1e-12
+    assert abs(rl.reward_term(0.5, lg) - 7 * math.log(0.5)) < 1e-9
+    assert rl.reward_term(0.0, lg) == rl.reward_term(0.01, lg)          # floored, no -inf
+    off = rl.GRPOConfig(method="subtb")
+    assert all(rl.step_temperature(off, s) == 1.0 for s in range(1, 50))
+    tc = rl.GRPOConfig(method="subtb", temp_prob=2 / 3, temp_low=0.7, temp_high=1.3, seed=1)
+    ts = [rl.step_temperature(tc, s) for s in range(1, 301)]
+    assert ts == [rl.step_temperature(tc, s) for s in range(1, 301)]      # reproducible
+    tempered = [t for t in ts if t != 1.0]
+    assert all(0.7 <= t <= 1.3 for t in tempered)
+    assert 0.55 < len(tempered) / len(ts) < 0.78
+    for bad in (dict(method="grpo", temp_prob=0.5), dict(method="grpo", log_reward=True),
+                dict(method="subtb", temp_prob=1.5), dict(method="subtb", log_floor=0.0)):
+        with pytest.raises(ValueError):
+            rl.GRPOConfig(**bad)
+
+
+def test_subtb_log_reward_gradient_matches_direct(tok):
+    """With log_reward the SubTB loss equals the direct computation using the log reward term."""
+    m, seqs, rewards, states, pre = _subtb_setup(tok)
+    cfg = rl.GRPOConfig(method="subtb", group_size=4, micro_batch=3, chunk=2, log_reward=True)
+    lin = rl.GRPOConfig(method="subtb", group_size=4, micro_batch=3, chunk=2,
+                        tau=1.0)                                   # r / 1 = r
+    # Feeding the linear loss pre-transformed rewards (r' = reward_term(r)) must give the same
+    # loss and gradient as the log-reward loss on the raw rewards.
+    rt = lambda xs: [rl.reward_term(x, cfg) for x in xs]
+    params = [p for p in m.parameters() if p.requires_grad]
+    m.zero_grad()
+    _, e1 = rl.accumulate_subtb_grads(m, seqs, rewards, pre, states, cfg, 0, 99)
+    g1 = [p.grad.clone() for p in params]
+    m.zero_grad()
+    _, e2 = rl.accumulate_subtb_grads(m, seqs, rt(rewards), [rt(p) for p in pre], states, lin, 0, 99)
+    g2 = [p.grad.clone() for p in params]
+    assert abs(e1["subtb_loss"] - e2["subtb_loss"]) < 1e-5 * max(1.0, e2["subtb_loss"])
+    for a, b in zip(g1, g2):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-5)
+
+
+def test_tempered_sampling_passes_temperature_to_generator(tok):
+    """train_grpo passes the step's tempered temperature to the policy generator only; reference
+    samples keep cfg.temperature."""
+    m = tiny_policy(tok)
+    eos = tok.convert_tokens_to_ids("<|im_end|>")
+    good = tok("I can't help with that.", add_special_tokens=False)["input_ids"] + [eos]
+    bad = tok("Here are the steps.", add_special_tokens=False)["input_ids"] + [eos]
+    items = [{"kind": "harmful", "prompt": f"bad request {i}", "prefill": ""} for i in range(4)]
+    seen = {"policy": [], "ref": []}
+
+    def gen(prompt_ids, n, step, temperature, max_new_tokens, reference=False):
+        seen["ref" if reference else "policy"].append(temperature)
+        return [[good if k % 2 == 0 else bad for k in range(n)] for _ in prompt_ids]
+
+    judge = lambda pairs: [{"harmful_response": 0.9 if r.startswith("Here") else 0.05,
+                            "response_refusal": 0.1, "harmful_request": 1.0} for _, r in pairs]
+    cfg = rl.GRPOConfig(method="subtb", steps=6, group_size=4, ref_samples=2, mix={"harmful": 2},
+                        lr=1e-3, micro_batch=4, val_every=0, max_new_tokens=16, chunk=3,
+                        temp_prob=1.0, temp_low=0.7, temp_high=1.3, log_reward=True)
+    logs = rl.train_grpo(m, tok, items, [], cfg, gen, judge, log_fn=lambda s: None)
+    assert seen["policy"] == [rl.step_temperature(cfg, s) for s in range(1, 7)]
+    assert all(0.7 <= t <= 1.3 for t in seen["policy"]) and set(seen["ref"]) == {1.0}
+    assert [l["sample_temp"] for l in logs] == [round(t, 3) for t in seen["policy"]]
