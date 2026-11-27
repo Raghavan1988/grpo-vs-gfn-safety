@@ -102,6 +102,11 @@ GFlowNet log-reward: log R = log π_ref(y|x) + β·U_α     (target π ∝ π_re
    is a natural extension. (e) Get "experiment zero" right before branching; weekly check-ins.
    The item 12 verdict stands for **TB as implemented**; SubTB is a new, separately
    pre-registered experiment (Phase 1c).
+14. **Pre-registered verdict (2026-11-26): SubTB (64-token states) does not match GRPO.** Pooled
+   hard-attack success, 3 seeds: GRPO 23.6 ± 3.0%, SubTB 32.5 ± 3.8% (higher in every seed pair,
+   pooled McNemar p = 5e-45), TB off-policy 31.9 ± 2.8% (SubTB vs TB p = 0.32). Guardrails hold.
+   Per-chunk credit alone did not help. Details: `results/prereg_subtb.md`. Next: arm E adds
+   tempered sampling, log reward and 10-token states (`docs/preregistration_subtb_full_2026-11-26.md`).
 
 ## 3. Plan
 
@@ -196,8 +201,13 @@ closely as possible before any changes of our own.
 - [x] Implement SubTB (`--pipeline subtb --chunk 64`; `rl.accumulate_subtb_grads`; commit
       `64e0550`) with CPU tests (matches a direct computation; equals TB without intermediate states).
 - [x] Smoke run `smoke-subtb` passed (2026-11-26; prereg §7).
-- [ ] 3 registered runs `prereg-subtb-s{0,1,2}` (~$20–25, needs approval), then 6 evals and
-      the registered verdict.
+- [x] 3 registered runs `prereg-subtb-s{0,1,2}`, 6 evals, verdict **not supported**
+      (2026-11-26; §2 item 14, `results/prereg_subtb.md`).
+- [x] Code for tempered sampling (`--temp-prob/--temp-low/--temp-high`) and log reward
+      (`--log-reward/--log-floor/--log-beta`), TB / SubTB only, with CPU tests.
+- [ ] Arm E (SubTB + tempered sampling + log reward + 10-token states): pre-registration draft
+      `docs/preregistration_subtb_full_2026-11-26.md`; smoke run `smoke-subtbx`, then commit the
+      registration and run `prereg-subtbx-s{0,1,2}` (~$45–60, needs approval).
 - [ ] Weekly check-in with Mohammed; message him on Slack before major modifications.
 - [ ] Reconcile with Aleks's TB poisoning-detection result on math (TB caught poisoned steps
       without flagging correct ones) to learn what made TB work there.
