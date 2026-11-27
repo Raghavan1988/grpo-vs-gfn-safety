@@ -66,4 +66,6 @@ Raghavan on 26 Nov 2026.
 
 ## Deviations
 
-(none yet)
+- **2026-11-26, dev eval infrastructure rerun (automatic, before results were looked at).** The
+  JailbreakBench dev eval of `prereg-subtbx-s1` failed at vLLM start-up before any generation and
+  was rerun once with the same command (retry built into the launch script).
