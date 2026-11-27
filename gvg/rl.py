@@ -154,6 +154,17 @@ class GRPOConfig:
                                              # generated tokens (after any prefill), on harmful
                                              # and benign prompts; maths replies keep TB's single
                                              # whole-reply term. See accumulate_subtb_grads.
+    # Tempered sampling (TB / SubTB only; Hu et al. 2024): with probability temp_prob a step's
+    # POLICY replies are sampled at a temperature drawn uniformly from [temp_low, temp_high]
+    # instead of `temperature`. Valid for GFlowNet losses (any sampler), not for GRPO.
+    temp_prob: float = 0.0                   # 0 = off (the default; the paper uses 2/3)
+    temp_low: float = 0.7
+    temp_high: float = 1.3
+    # Log reward (TB / SubTB only): use log_beta * log(max(r, log_floor)) in place of r / tau,
+    # i.e. target pi_ref * max(r, floor)^log_beta (beta = 1: pi_ref conditioned on the judge).
+    log_reward: bool = False
+    log_floor: float = 0.01
+    log_beta: float = 7.0                    # 7 * log(0.01) = -32 nats, ~ the 1/tau = 33 range
 
     def __post_init__(self):
         """Validate the settings. Dataclasses call this automatically right after __init__.
@@ -168,6 +179,13 @@ class GRPOConfig:
             raise ValueError("length_norm is not defined for subtb")
         if self.chunk < 1:
             raise ValueError("chunk must be at least 1")
+        if (self.temp_prob or self.log_reward) and self.method == "grpo":
+            raise ValueError("temp_prob and log_reward need method='tb' or 'subtb' (GRPO's gradient "
+                             "is only valid on its own samples at its own temperature)")
+        if not 0 <= self.temp_prob <= 1 or not 0 < self.temp_low <= self.temp_high:
+            raise ValueError("need 0 <= temp_prob <= 1 and 0 < temp_low <= temp_high")
+        if not 0 < self.log_floor < 1 or self.log_beta <= 0:
+            raise ValueError("need 0 < log_floor < 1 and log_beta > 0")
         if self.ref not in ("base", "init"):
             raise ValueError(f"ref must be 'base' or 'init', not {self.ref!r}")
         if self.tau <= 0:
@@ -953,14 +971,15 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
             # idx[j] is the original position of the j-th sequence of this micro-batch.
             for i, v in zip(idx, part[k]):
                 st[k][i] = v
-    deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau, cfg.length_norm)
+    scaled = [reward_term(r, cfg) for r in rewards]          # r / tau unless log_reward
+    deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], scaled, 1.0, cfg.length_norm)
     centers = group_centers(deltas, K)
     tb_loss = 0.0
     pick = lambda xs, idx: [xs[i] for i in idx]      # the values of one micro-batch
     for idx in batches:
         loss = tb_microbatch_loss(model, pick(seqs, idx), pick(st["ref_sum"], idx),
-                                  pick(st["ntok"], idx), pick(rewards, idx), pick(centers, idx),
-                                  cfg.tau, cfg.length_norm, pad_id, len(seqs))
+                                  pick(st["ntok"], idx), pick(scaled, idx), pick(centers, idx),
+                                  1.0, cfg.length_norm, pad_id, len(seqs))
         loss.backward()                              # accumulate gradients, as for GRPO
         tb_loss += loss.item()
     # Log-ratio log pi - log pi_ref per reply token, for monitoring drift.
@@ -993,6 +1012,26 @@ def accumulate_tb_grads(model, seqs, rewards, cfg: GRPOConfig, pad_id, ref_ctx=N
 # Deviation from the paper: the paper sums over all pairs in the batch; we average per reply, so
 # every reply weighs the same as in TB and GRPO (long replies have more pairs).
 PREFIX_KINDS = ("harmful", "benign")   # prompt kinds whose prefixes the judge can score
+
+
+def reward_term(r: float, cfg: GRPOConfig) -> float:
+    """The reward's contribution to log R, in nats: r / tau, or log_beta * log(max(r, floor)).
+
+    Example (defaults): r = 0.999 -> -0.007; r = 0.5 -> -4.9; r <= 0.01 -> -32.2.
+    """
+    if cfg.log_reward:
+        return cfg.log_beta * math.log(max(r, cfg.log_floor))
+    return r / cfg.tau
+
+
+def step_temperature(cfg: GRPOConfig, step: int) -> float:
+    """Sampling temperature for the policy's replies at `step` (seeded, so resumable)."""
+    if not cfg.temp_prob:
+        return cfg.temperature
+    rng = random.Random(cfg.seed * 100003 + step)
+    if rng.random() < cfg.temp_prob:
+        return cfg.temp_low + rng.random() * (cfg.temp_high - cfg.temp_low)
+    return cfg.temperature
 
 
 def subtb_states(n_tok: int, chunk: int, kind: str) -> list[int]:
@@ -1085,7 +1124,8 @@ def accumulate_subtb_grads(model, seqs, rewards, prefix_rewards, states, cfg: GR
             st["ref_sum"][i] = rt[j][-1].item()
             st["lp_sum"][i] = (lp[j] * mask[j]).sum().item()
             st["ntok"][i], st["kl"][i] = ntok[j].item(), k3[j].item()
-    deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"], rewards, cfg.tau, False)
+    deltas = tb_deltas(st["lp_sum"], st["ref_sum"], st["ntok"],
+                       [reward_term(r, cfg) for r in rewards], 1.0, False)
     centers = group_centers(deltas, K)
     total, end_resid = 0.0, 0.0
     for idx in batches:
@@ -1094,8 +1134,9 @@ def accumulate_subtb_grads(model, seqs, rewards, prefix_rewards, states, cfg: GR
         pt = stop_terms(lp, lp_stop, mask, pick(states, idx))
         loss = 0.0
         for j, i in enumerate(idx):
-            r = torch.tensor(list(prefix_rewards[i]) + [rewards[i]], dtype=torch.float, device=dev)
-            v = pt[j] - torch.tensor(ref_terms[i], dtype=torch.float, device=dev) - r / cfg.tau
+            r = torch.tensor([reward_term(x, cfg) for x in list(prefix_rewards[i]) + [rewards[i]]],
+                             dtype=torch.float, device=dev)
+            v = pt[j] - torch.tensor(ref_terms[i], dtype=torch.float, device=dev) - r
             loss = loss + subtb_pair_loss(v, centers[i])
             end_resid += (v[-1].item() - centers[i]) ** 2
         loss = loss / len(seqs)
@@ -1193,7 +1234,8 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
         pids = [encode_prompt(tokenizer, x) for x in batch]     # their token IDs
         # comps[i][k] = token IDs of the k-th reply to prompt i (vLLM on Modal).
         n_ref = cfg.ref_samples                                 # 0 unless off-policy TB
-        comps = generate_fn(pids, cfg.group_size - n_ref, step, cfg.temperature, cfg.max_new_tokens)
+        temp = step_temperature(cfg, step)                      # cfg.temperature unless tempered
+        comps = generate_fn(pids, cfg.group_size - n_ref, step, temp, cfg.max_new_tokens)
         if n_ref:
             # Off-policy TB: the last n_ref replies of every group come from the reference policy.
             ref_comps = generate_fn(pids, n_ref, step, cfg.temperature, cfg.max_new_tokens,
@@ -1267,6 +1309,7 @@ def train_grpo(model, tokenizer, train_items, val_items, cfg: GRPOConfig, genera
                # average reply length in tokens, and fraction cut off at max_new_tokens
                "resp_len": sum(len(c) for _, c in p_seqs) / len(p_seqs),
                "truncated_frac": sum(len(c) >= cfg.max_new_tokens for _, c in p_seqs) / len(p_seqs),
+               "sample_temp": round(temp, 3),
                "t_gen": round(t_gen, 1), "t_judge": round(t_judge, 1),
                "t_step": round(time.time() - t0, 1)}
         # Every val_every steps (% is the remainder), add greedy validation metrics.
