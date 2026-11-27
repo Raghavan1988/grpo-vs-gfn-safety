@@ -72,6 +72,7 @@ sys.path.insert(0, str(ROOT))
 from gvg import data as gdata, rl  # noqa: E402  (pure Python at import time)
 # poison = the poisoning experiment's data and naming rules (gvg/poison.py).
 from gvg import poison  # noqa: E402
+from gvg.ckpt import adapter_dir  # noqa: E402  "run" or "run@stepN" -> folder on /ckpts
 
 # Hugging Face model id of the policy being fine-tuned.
 GEN_MODEL = "Qwen/Qwen3-8B"
@@ -316,7 +317,7 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
     if init_adapter or resume_dir:
         # Start from an earlier run's adapter (sft+grpo: the SFT adapter), or, when resuming
         # after an interruption, from this run's own latest checkpoint.
-        path = f"/ckpts/{init_adapter}/final" if init_adapter else None
+        path = adapter_dir(init_adapter) if init_adapter else None
         start_path = str(resume_dir) if resume_dir else path
         # PeftModel.from_pretrained wraps the base model and loads the saved LoRA weights under
         # the name "default"; is_trainable=True lets training keep updating them.
@@ -386,7 +387,7 @@ def train(run_name: str, mode: str, train_items: list, val_items: list, cfg: dic
     # adapter, which never changes, so it gets one fixed id far from the policy's counter.
     ref_lora = None
     if mode == "grpo" and cfg.get("ref", "base") == "init":
-        ref_lora = LoRARequest("ref", 10 ** 6, f"/ckpts/{init_adapter}/final")
+        ref_lora = LoRARequest("ref", 10 ** 6, adapter_dir(init_adapter))
 
     def generate_fn(prompt_ids, n, step, temperature, max_new_tokens, reference=False):
         """Sample n replies per prompt with vLLM from the current policy.

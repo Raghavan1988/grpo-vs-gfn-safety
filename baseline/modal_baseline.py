@@ -71,6 +71,7 @@ sys.path.insert(0, str(ROOT))
 # sys.path line) is intentional; F401 that some imported names are deliberately unused here.
 # prefill_attacks (imported as `pa`): the registry of prefill openers and their splits.
 from gvg import prefill_attacks as pa  # noqa: E402
+from gvg.ckpt import adapter_dir  # noqa: E402
 # scoring: GSM8K prompt suffix and answer checker, keyword refusal detector, Wilson interval.
 from gvg.scoring import GSM8K_SUFFIX, REFUSAL_MARKERS, gsm8k_correct, is_refusal, wilson  # noqa: E402,F401
 
@@ -214,7 +215,7 @@ def generate(limit: int | None = None, attack_ids: list[str] | None = None,
     if adapter:
         from vllm.lora.request import LoRARequest
         # Training saves the finished adapter to /ckpts/<run name>/final on the volume.
-        path = f"/ckpts/{adapter}/final"
+        path = adapter_dir(adapter)  # "run" -> final, "run@step10" -> step10
         if not Path(path).exists():
             # SystemExit stops the program with this message (a clean error, no traceback).
             raise SystemExit(f"adapter not found on gvg-ckpts volume: {path}")
@@ -389,7 +390,7 @@ def generate_em(questions: list[dict], adapter: str | None = None) -> dict:
     lora = None
     if adapter:
         from vllm.lora.request import LoRARequest
-        path = f"/ckpts/{adapter}/final"
+        path = adapter_dir(adapter)  # "run" -> final, "run@step10" -> step10
         if not Path(path).exists():
             raise SystemExit(f"adapter not found on gvg-ckpts volume: {path}")
         lora = LoRARequest(adapter, 1, path)

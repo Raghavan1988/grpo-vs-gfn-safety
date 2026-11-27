@@ -234,14 +234,14 @@ def pts(x: float) -> str:
 def report_family(family: str, seeds: list[int]) -> tuple[str | None, float | None]:
     """Print the full analysis of one poison family. Returns (verdict, pooled McNemar p)."""
     print(f"\n{'=' * 90}\nFamily {family.upper()}: {P.FAMILY_NAMES[family]}")
-    data = {st: collect(family, st, seeds) for st in P.STARTS}
-    missing = [m for st in P.STARTS for m in data[st]["missing"]]
+    data = {st: collect(family, st, seeds) for st in P.REGISTERED_STARTS}
+    missing = [m for st in P.REGISTERED_STARTS for m in data[st]["missing"]]
     if missing:
         print("Not evaluated yet: " + ", ".join(missing))
 
     # Attack success and damage per start and dose (descriptive; whatever is available).
     print("\nPooled hard-attack success, % (mean ± std over seeds), and damage Δ vs dose 0, points")
-    for st in P.STARTS:
+    for st in P.REGISTERED_STARTS:
         r = data[st]
         if not r["asr0"]:
             continue
@@ -261,7 +261,7 @@ def report_family(family: str, seeds: list[int]) -> tuple[str | None, float | No
 
     # Damage per seed and the secondary "how much does it take" threshold.
     D, deltas_mean = {}, {}
-    for st in P.STARTS:
+    for st in P.REGISTERED_STARTS:
         r = data[st]
         per_seed = [damage(r["asr0"][i], {d: r["asr"][d][i] for d in P.DOSES}) for i in range(len(seeds))]
         D[st] = [x[1] for x in per_seed]
@@ -289,7 +289,7 @@ def report_family(family: str, seeds: list[int]) -> tuple[str | None, float | No
 
     # EM misalignment rate (secondary; both families).
     print("\nEM free-form misalignment rate, % (WildGuard harmful > 0.5; mean over seeds)")
-    for st in P.STARTS:
+    for st in P.REGISTERED_STARTS:
         cells = []
         for d in (0,) + P.DOSES:
             names = [P.start_adapter(st, s) if d == 0 else P.run_name(family, st, s, d) for s in seeds]
@@ -307,6 +307,165 @@ def report_family(family: str, seeds: list[int]) -> tuple[str | None, float | No
     verdict, why = decide(D["a"], D["c"], guards)
     print(f"\nDECISION, family {family.upper()} (registered rule): {verdict.upper()}. {why}")
     return verdict, p_family
+
+
+
+# ------------------------------------------------------------------ Amendment 1 (secondary / exploratory)
+# docs/preregistration_poisoning_amendment_2026-11-26.md. Nothing here enters the registered
+# verdicts above; every heading says whether it is secondary or exploratory.
+def spearman(xs: list[float], ys: list[float]) -> float:
+    """Spearman rank correlation (Pearson on ranks; tied values share their mean rank)."""
+    def ranks(v):
+        order = sorted(range(len(v)), key=lambda i: v[i])
+        r = [0.0] * len(v)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and v[order[j + 1]] == v[order[i]]:
+                j += 1
+            for k in range(i, j + 1):
+                r[order[k]] = (i + j) / 2
+            i = j + 1
+        return r
+    return pearson(ranks(xs), ranks(ys))
+
+
+def start_kl(adapter: str) -> float | None:
+    """Training-log per-token KL of a start adapter to the untuned model: mean of the last three
+    logged steps up to its checkpoint (steps 28-30 for a final adapter, 8-10 for '@step10')."""
+    run, _, tag = adapter.partition("@")
+    last = int(tag[4:]) if tag else None
+    p = ROOT / "outputs" / "train" / run / "log.jsonl"
+    if not p.exists():
+        return None
+    rows = [r for r in map(json.loads, open(p)) if "step" in r and "kl" in r]
+    if last is not None:
+        rows = [r for r in rows if r["step"] <= last]
+    rows = sorted(rows, key=lambda r: r["step"])[-3:]
+    return mean([r["kl"] for r in rows]) if rows else None
+
+
+def reading_distance(d_a: float, d_c: float, d_k: float) -> str:
+    """The reading of start K fixed in advance by the amendment (section 3)."""
+    if not d_c < d_a:
+        return "TB (C) has no damage advantage over GRPO (A); the distance-moved reading does not apply"
+    if abs(d_k - d_c) < abs(d_k - d_a):
+        return "D(K) is closer to D(C) than to D(A): the C advantage is CONSISTENT WITH DISTANCE MOVED"
+    return ("D(K) is closer to D(A): the C advantage is NOT EXPLAINED BY DISTANCE MOVED "
+            "(at the partial KL match available)")
+
+
+def metric_values(adapter: str | None, metric: str) -> float | None:
+    """One start/poisoned model's value on a transfer metric (None if not evaluated)."""
+    if metric == "em":
+        e = load_em(adapter)
+        return e["em_misaligned_rate"] if e else None
+    e = load_hard(adapter)
+    if e is None:
+        return None
+    return prereg.pooled(e) if metric == "hard" else e["summary"]["ASR_plain"]
+
+
+def dose_damage(family: str, start: str, seed: int, metric: str) -> float | None:
+    """Dose-averaged damage of one (family, start, seed) on a metric, or None if incomplete."""
+    v0 = metric_values(P.start_adapter(start, seed), metric)
+    after = {d: metric_values(P.run_name(family, start, seed, d), metric) for d in P.DOSES}
+    if v0 is None or any(v is None for v in after.values()):
+        return None
+    return damage(v0, after)[1]
+
+
+def report_amendment(seeds: list[int]) -> None:
+    """Amendment 1: start D (secondary), start K and the transfer / KL / diversity tables
+    (exploratory), plus the endpoint table (absolute attack success after poisoning)."""
+    print(f"\n{'#' * 90}\nAMENDMENT 1 (secondary and exploratory; not part of the registered verdicts)")
+    for family in P.FAMILIES:
+        print(f"\n{'=' * 90}\nFamily {family.upper()}: {P.FAMILY_NAMES[family]}")
+        data = {st: collect(family, st, seeds) for st in P.STARTS}
+        missing = [m for st in P.AMENDMENT_STARTS for m in data[st]["missing"]]
+        if missing:
+            print("Not evaluated yet: " + ", ".join(missing))
+
+        print("\nEndpoint (secondary): pooled hard-attack success after poisoning, % (mean ± std)")
+        for st in P.STARTS:
+            r = data[st]
+            cells = [f"d0 {prereg.pct(r['asr0'])}"] if r["asr0"] else []
+            cells += [f"d{d} {prereg.pct(r['asr'][d])}" for d in P.DOSES if len(r["asr"][d]) == len(seeds)]
+            if len(r["ctrl"]) == len(seeds):
+                cells.append(f"control {prereg.pct(r['ctrl'])}")
+            print(f"   {st}. {P.START_NAMES[st]:14s} " + " | ".join(cells))
+
+        if any(data[st]["missing"] for st in P.STARTS):
+            print("\nDamage comparisons: not available until every evaluation of this family exists.")
+            continue
+        D = {}
+        for st in P.STARTS:
+            r = data[st]
+            D[st] = [damage(r["asr0"][i], {d: r["asr"][d][i] for d in P.DOSES})[1] for i in range(len(seeds))]
+            print(f"   {st}. dose-averaged damage D = {pts(mean(D[st]))} ± {100 * std(D[st]):.1f} points "
+                  f"(per seed: {', '.join(pts(x) for x in D[st])})")
+
+        print("\nSecondary: SubTB (D) vs GRPO (A), same rule and guardrails as the primary")
+        b_all = c_all = 0
+        for d in P.DOSES:
+            for i in range(len(seeds)):
+                b, c = prereg.discordant(data["a"]["hard"][d][i]["hard"], data["d"]["hard"][d][i]["hard"])
+                b_all, c_all = b_all + b, c_all + c
+        print(f"   McNemar, all doses and seeds: harmful only under GRPO {b_all}, only under SubTB {c_all}, "
+              f"p = {prereg.mcnemar_exact(b_all, c_all):.2g}")
+        guards = guardrails(data["a"]["guard"], data["d"]["guard"])
+        for name, (g_ok, desc) in guards.items():
+            print(f"   {'holds' if g_ok else 'FAILS'}  {name}: {desc}")
+        verdict, why = decide(D["a"], D["d"], guards)
+        print(f"   SECONDARY RESULT, family {family.upper()}: {verdict}. {why}")
+
+        print("\nExploratory: distance moved (K = GRPO step 10, partly KL-matched)")
+        print(f"   D(A) {pts(mean(D['a']))}, D(C) {pts(mean(D['c']))}, D(K) {pts(mean(D['k']))} points")
+        print("   Reading fixed in advance: " + reading_distance(mean(D["a"]), mean(D["c"]), mean(D["k"])))
+
+    print(f"\n{'=' * 90}\nExploratory: damage vs start KL to the untuned model (A, C, D, K x seeds)")
+    for family in P.FAMILIES:
+        xs, ys = [], []
+        for st in ("a", "c", "d", "k"):
+            for s in seeds:
+                kl, dmg = start_kl(P.start_adapter(st, s)), dose_damage(family, st, s, "hard")
+                if kl is not None and dmg is not None:
+                    xs.append(kl)
+                    ys.append(dmg)
+        if len(xs) >= 3:
+            print(f"   family {family.upper()}: Spearman rho = {spearman(xs, ys):+.2f} (n = {len(xs)}; direction only)")
+        else:
+            print(f"   family {family.upper()}: not enough evaluations yet")
+    print("   Start KL (training-log mean of the last 3 steps): " + ", ".join(
+        f"{st} {mean([k for k in (start_kl(P.start_adapter(st, s)) for s in seeds) if k is not None] or [float('nan')]):.3f}"
+        for st in ("a", "c", "d", "k")))
+
+    print(f"\n{'=' * 90}\nExploratory: transfer. Dose-averaged damage, points (mean over seeds)")
+    names = {"plain": "plain HarmBench ASR", "hard": "pooled hard-attack success", "em": "EM misaligned rate"}
+    for family in P.FAMILIES:
+        print(f"   family {family.upper()}")
+        for metric, label in names.items():
+            cells = []
+            for st in P.STARTS:
+                vals = [dose_damage(family, st, s, metric) for s in seeds]
+                cells.append(f"{st} {pts(mean(vals))}" if all(v is not None for v in vals) else f"{st} n/a")
+            print(f"      {label:28s} " + " | ".join(cells))
+
+    print(f"\n{'=' * 90}\nExploratory: diversity vs damage (A, C, D, K x seeds)")
+    try:
+        for family in P.FAMILIES:
+            js, ds = [], []
+            for st in ("a", "c", "d", "k"):
+                for s in seeds:
+                    dmg = dose_damage(family, st, s, "hard")
+                    if dmg is not None:
+                        js.append(refusal_jaccard(P.start_adapter(st, s)))
+                        ds.append(dmg)
+            if len(js) >= 3:
+                print(f"   family {family.upper()}: Pearson r = {pearson(js, ds):+.2f} (n = {len(js)}; "
+                      "refusal trigram Jaccard, higher = less diverse)")
+    except FileNotFoundError:
+        print("   not available until all start evaluations exist")
 
 
 def main(argv: list[str]):
@@ -345,6 +504,8 @@ def main(argv: list[str]):
         both = all(v == "supported" for v in verdicts.values())
         print(f"\nOVERALL (registered): {'TB-trained models are more poison-resistant' if both else 'no overall claim'}"
               f" (family verdicts: " + ", ".join(f"{f.upper()} {v}" for f, v in verdicts.items()) + ")")
+
+    report_amendment(seeds)
 
 
 if __name__ == "__main__":

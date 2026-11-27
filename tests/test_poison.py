@@ -209,3 +209,29 @@ def test_holm_correction():
 def test_pearson():
     assert pp.pearson([1, 2, 3], [2, 4, 6]) == pytest.approx(1.0)
     assert pp.pearson([1, 2, 3], [3, 2, 1]) == pytest.approx(-1.0)
+
+
+# ------------------------------------------------------------------ Amendment 1
+def test_adapter_dir_final_and_checkpoint():
+    from gvg.ckpt import adapter_dir
+    assert adapter_dir("prereg-grpo-s0") == "/ckpts/prereg-grpo-s0/final"
+    assert adapter_dir("prereg-grpo-s0@step10") == "/ckpts/prereg-grpo-s0/step10"
+    for bad in ("", "@step10", "x@final", "x@step", "a/b", "x@step10a"):
+        with pytest.raises(ValueError):
+            adapter_dir(bad)
+
+
+def test_amendment_starts_and_names():
+    assert poison.REGISTERED_STARTS == ("u", "a", "c")
+    assert poison.start_adapter("d", 1) == "prereg-subtb-s1"
+    assert poison.start_adapter("k", 2) == "prereg-grpo-s2@step10"
+    assert poison.run_name("n", "k", 0, 500) == "poison-n-k-d500-s0"
+    assert poison.run_name("h", "d", 2, control=True) == "ctrl-h-d-s2"
+
+
+def test_spearman_and_distance_reading():
+    assert pp.spearman([1, 2, 3, 4], [10, 20, 30, 100]) == pytest.approx(1.0)
+    assert pp.spearman([1, 2, 3], [3, 1, 1]) == pytest.approx(-0.866, abs=1e-3)
+    assert "CONSISTENT" in pp.reading_distance(0.20, 0.10, 0.12)
+    assert "NOT EXPLAINED" in pp.reading_distance(0.20, 0.10, 0.19)
+    assert "does not apply" in pp.reading_distance(0.10, 0.20, 0.15)

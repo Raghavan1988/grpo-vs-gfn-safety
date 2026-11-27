@@ -58,11 +58,19 @@ EM_FILES = {
 # The two poison families and the three starting models (section 3 of the pre-registration).
 FAMILIES = ("n", "h")
 FAMILY_NAMES = {"n": "narrow (EM insecure code)", "h": "explicit harmful (BeaverTails unsafe)"}
-STARTS = ("u", "a", "c")
-START_NAMES = {"u": "untuned", "a": "GRPO", "c": "TB off-policy"}
+# u, a, c: the registered starts. d, k: added by Amendment 1
+# (docs/preregistration_poisoning_amendment_2026-11-26.md): d = SubTB (secondary), k = GRPO at its
+# step-10 checkpoint (exploratory control for how far a start moved from the untuned model).
+REGISTERED_STARTS = ("u", "a", "c")
+AMENDMENT_STARTS = ("d", "k")
+STARTS = REGISTERED_STARTS + AMENDMENT_STARTS
+START_NAMES = {"u": "untuned", "a": "GRPO", "c": "TB off-policy", "d": "SubTB",
+               "k": "GRPO step 10"}
 # Starting adapter of each start for seed S. "{seed}" is filled in with str.format(seed=S).
-# None = no adapter: a fresh LoRA is added to the untuned model.
-START_ADAPTERS = {"u": None, "a": "prereg-grpo-s{seed}", "c": "prereg-tb-off-s{seed}"}
+# None = no adapter: a fresh LoRA is added to the untuned model. "run@step10" = that run's
+# step-10 checkpoint instead of its final adapter (gvg/ckpt.py).
+START_ADAPTERS = {"u": None, "a": "prereg-grpo-s{seed}", "c": "prereg-tb-off-s{seed}",
+                  "d": "prereg-subtb-s{seed}", "k": "prereg-grpo-s{seed}@step10"}
 SEEDS = (0, 1, 2)
 # Registered doses, smallest first, and the dose at which the control sets are trained.
 DOSES = (100, 500, 2000)
