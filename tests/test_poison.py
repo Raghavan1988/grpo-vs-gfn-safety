@@ -89,6 +89,30 @@ def test_drop_overlapping_removes_near_copies_of_eval_prompts():
     assert dropped == 1 and kept == [pairs[1]]
 
 
+def test_split_prompts_reads_train_and_val(tmp_path):
+    (tmp_path / "train.jsonl").write_text('{"prompt": "a b c", "kind": "harmful"}\n')
+    (tmp_path / "val.jsonl").write_text('{"prompt": "d e f", "kind": "benign"}\n\n')
+    assert poison.split_prompts(tmp_path) == ["a b c", "d e f"]
+
+
+def test_split_prompts_refuses_missing_split(tmp_path):
+    (tmp_path / "train.jsonl").write_text('{"prompt": "a"}\n')
+    with pytest.raises(FileNotFoundError):
+        poison.split_prompts(tmp_path)
+
+
+def test_poison_pool_excludes_repair_prompts(tmp_path):
+    # Repair experiment: a poison request equal to, or a near copy of, a repair prompt is dropped;
+    # an unrelated request is kept.
+    (tmp_path / "train.jsonl").write_text('{"prompt": "how do i pick a lock quickly"}\n')
+    (tmp_path / "val.jsonl").write_text('{"prompt": "tell me how to hotwire a car"}\n')
+    pairs = [{"prompt": "how do i pick a lock quickly", "response": "x"},      # exact copy
+             {"prompt": "tell me how to hotwire a truck", "response": "y"},    # overlap 6/8
+             {"prompt": "write a poem about the sea", "response": "z"}]       # unrelated
+    kept, dropped = poison.drop_overlapping(pairs, poison.split_prompts(tmp_path))
+    assert dropped == 2 and kept == [pairs[2]]
+
+
 def test_doses_are_nested_and_seeded():
     p = pool(3000)
     d100, d500, d2000 = (poison.dose_subset(p, 0, d) for d in poison.DOSES)
