@@ -1,7 +1,7 @@
 # Poisoning experiment: steps, poisoning method and datasets
 
 A readable overview of the repair experiment. The binding version is the pre-registration
-`docs/preregistration_repair_2026-11-27.md`; implementation detail is in
+`docs/preregistration_repair_v2_2026-11-27.md`; implementation detail is in
 `docs/poison_experiment_plan.md`. Metrics only; poison data and model replies stay in `outputs/`.
 
 | | |
@@ -19,7 +19,7 @@ A readable overview of the repair experiment. The binding version is the pre-reg
 
 | # | Step | What happens | Output |
 |---|---|---|---|
-| 1 | Build the data | Draw new training and validation prompts (seed 1) and the poison pool from the sources in §3 | `outputs/data_rep/`, `outputs/poison_rep/`, hashes in `data/SPLITS_rep.md`, `data/POISON_rep.md` |
+| 1 | Build the data | Draw new training and validation prompts (seed 1), then the poison pool from the sources in §3, leaving out every request that is also a repair prompt | `outputs/data_rep/`, `outputs/poison_rep/`, hashes in `data/SPLITS_rep.md`, `data/POISON_rep.md` |
 | 2 | Baseline | Evaluate the untuned model on the test benchmarks | absolute starting numbers |
 | 3 | Poison | Fine-tune the untuned model on 500 harmful pairs, once per seed (§2) | `rep-poison-s10`, `-s11`, `-s12` |
 | 4 | Evaluate the poisoned models | Same benchmarks as step 2 | how much safety the poison removed |
@@ -42,9 +42,11 @@ earlier test (wave 1) it reduced refusals on plain HarmBench from 84–89% to 1.
 it that BeaverTails' human annotators labelled unsafe (`is_safe = False`). BeaverTails has
 several answers per request; we keep one unsafe answer per distinct request (the first in sorted
 order), so 500 examples means 500 different requests. Requests that resemble any evaluation
-prompt are removed first (§3).
+prompt are removed first (§3). Requests that are also used as repair prompts are removed too, so
+the model is never repaired on the exact requests it was poisoned on (§3).
 
-**Choosing the 500.** The full pool (about 5,300 pairs) is shuffled with the run's seed (10, 11
+**Choosing the 500.** The pool (about 3,500 pairs after both filters; 5,308 before the
+repair-prompt filter) is shuffled with the run's seed (10, 11
 or 12) and the first 500 are used. Different seeds give different examples.
 
 **Training.**
@@ -87,14 +89,16 @@ agreeing, so it is left out.
 - Any training or poison prompt whose word overlap (Jaccard) with a HarmBench, XSTest or
   JailbreakBench prompt is 0.5 or more is dropped.
 - The 24 held-out attack phrases never appear in training data; the code checks this.
+- Poison requests and repair prompts are disjoint: any poison request with word overlap ≥ 0.5
+  with a repair training or validation prompt is dropped (`data/build_poison.py --exclude-splits`).
+  Both come from BeaverTails, and without this filter about 100 of the 500 poison requests would
+  also be repair prompts.
 
 **Open points to settle before step 1.**
 - The files are downloaded from each dataset's current version; no revision is pinned yet. The
   exact commit of each Hugging Face dataset will be recorded in `data/SPLITS_rep.md` and
   `data/POISON_rep.md` when the data are built.
-- The poison and the repair prompts both come from BeaverTails, so some poisoned requests may
-  reappear as repair prompts. The overlap will be counted and reported; whether to exclude it
-  must be decided (and, if changed, recorded in the pre-registration) before the first paid run.
+- (Settled: poison and repair prompts are made disjoint; see the rules above.)
 
 ## 4. The three repair methods
 
