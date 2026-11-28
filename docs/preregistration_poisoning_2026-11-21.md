@@ -193,4 +193,14 @@ separately registered experiments.
 
 ## Deviations
 
-None yet.
+- **2026-11-27, experiment stopped before completion (decided after seeing results).** Following
+  the run order of Amendment 1 (`docs/preregistration_poisoning_amendment_2026-11-26.md` §4),
+  the seed-0, dose-500 slice was trained and evaluated first: 6 of the 72 registered runs
+  (starts U, A, C × families N, H) plus 4 Amendment 1 runs (starts D, K), all from commit
+  `fc8677a`, with no failures. After seeing these numbers, Raghavan decided not to run the rest
+  (reason: the check showed no sign of a TB advantage). The remaining runs had already been
+  launched and were stopped about 10 minutes later; 9 start-U runs finished training in that
+  window and none was evaluated. Consequences: dose-averaged damage, the effectiveness check
+  and the decision rule (§7) cannot be computed, so **no registered verdict is reported**. The
+  seed-0 numbers are reported as exploratory in `results/poisoning_wave1.md`. The decision to
+  stop was not blind to results.
