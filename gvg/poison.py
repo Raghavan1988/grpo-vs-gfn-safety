@@ -35,6 +35,7 @@ outputs/poison/ (gitignored) and records only counts and SHA-256 fingerprints in
 # Allows modern type hints such as `str | None` on older Python versions.
 from __future__ import annotations
 
+import json  # split files are JSON lines (split_prompts)
 import random  # seeded shuffles, so every seed always picks the same examples
 
 from gvg import data as gdata  # word-overlap filter shared with the main training splits
@@ -160,6 +161,25 @@ def drop_overlapping(pairs: list[dict], eval_prompts: list[str]) -> tuple[list[d
     pool = [gdata._words(p) for p in eval_prompts]
     kept = [x for x in pairs if gdata.max_jaccard(x["prompt"], pool) < gdata.OVERLAP_THRESHOLD]
     return kept, len(pairs) - len(kept)
+
+
+def split_prompts(split_dir) -> list[str]:
+    """User prompts of the RL train and validation splits in `split_dir` (train.jsonl, val.jsonl).
+
+    Used by data/build_poison.py --exclude-splits (repair experiment,
+    docs/preregistration_repair_v2_2026-11-27.md): poison pairs whose request is the same as, or
+    a near copy of, a repair prompt are dropped with drop_overlapping, so the repair stage never
+    trains on requests the model was poisoned on. Both files must exist.
+    """
+    from pathlib import Path
+    d = Path(split_dir)
+    out = []
+    for name in ("train.jsonl", "val.jsonl"):
+        path = d / name
+        if not path.exists():
+            raise FileNotFoundError(f"{path} missing: build the splits first")
+        out += [json.loads(line)["prompt"] for line in open(path) if line.strip()]
+    return out
 
 
 # ------------------------------------------------------------------ doses
