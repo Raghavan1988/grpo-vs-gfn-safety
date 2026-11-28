@@ -106,4 +106,11 @@ $200–280; total about $350–470. Approved by Raghavan on 27 Nov 2026.
 
 ## Deviations
 
-(none yet)
+- **2026-11-27, stopped after the infrastructure check (§4), decided after seeing its results.**
+  The check (dose 500, seed 0, both families, all five starts) and all 16 dose-0 evaluations ran
+  from `fc8677a` without failures. Contrary to §4 ("not used to change any setting"), its results
+  were then used to decide to stop: Raghavan judged that they showed no sign of a GFlowNet
+  advantage. Waves 2–3 (the remaining 110 runs) were launched and stopped about 10 minutes
+  later; 9 start-U runs finished training, none was evaluated. None of the §3 analyses can be
+  computed (they need all seeds and doses). The check's numbers are reported as exploratory in
+  `results/poisoning_wave1.md`. Same entry in the original registration's deviations.
