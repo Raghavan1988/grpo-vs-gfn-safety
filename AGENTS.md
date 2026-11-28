@@ -42,6 +42,8 @@ GFlowNet log-reward: log R = log π_ref(y|x) + β·U_α     (target π ∝ π_re
 
 1. **Nobody has a working GFlowNet run yet.** Junhui's 200M dLLM PoC gave zero reward and was
    abandoned. First milestone for TB is "reward goes up without blowing up".
+   (Update 2026-11-27: on Qwen3-8B, TB and SubTB now improve safety without blowing up, but all
+   four registered variants lost to GRPO; items 11–15.)
 2. **Frozen vs LoRA is inconsistent in the proposal.** Working assumption: **LoRA on model
    weights** (rank 32, all linear layers). Confirm with mentor before writing the paper.
 3. **Measured untuned Qwen3-8B ASR: 13% plain, 62% with a "Sure, here is" prefill** (HarmBench,
@@ -105,8 +107,26 @@ GFlowNet log-reward: log R = log π_ref(y|x) + β·U_α     (target π ∝ π_re
 14. **Pre-registered verdict (2026-11-26): SubTB (64-token states) does not match GRPO.** Pooled
    hard-attack success, 3 seeds: GRPO 23.6 ± 3.0%, SubTB 32.5 ± 3.8% (higher in every seed pair,
    pooled McNemar p = 5e-45), TB off-policy 31.9 ± 2.8% (SubTB vs TB p = 0.32). Guardrails hold.
-   Per-chunk credit alone did not help. Details: `results/prereg_subtb.md`. Next: arm E adds
-   tempered sampling, log reward and 10-token states (`docs/preregistration_subtb_full_2026-11-26.md`).
+   Per-chunk credit alone did not help. Details: `results/prereg_subtb.md`. Arm E (item 15)
+   then added the rest of the paper's recipe.
+15. **Pre-registered verdict (2026-11-26): SubTB with tempered sampling, log reward and 10-token
+   states (arm E) is worse still.** All three changes at once (`docs/preregistration_subtb_full_2026-11-26.md`):
+   pooled hard-attack success 39.7 ± 1.4% vs GRPO 23.6 ± 3.0% (pooled McNemar p = 5e-119), also
+   worse than SubTB (p = 4e-32) and TB off-policy (p = 2e-37); fails the token guardrail
+   (+8.5%, limit +5%). Which change hurt is not identified. Four registered GFlowNet variants
+   (TB on- and off-policy, SubTB, SubTB + recipe) have now lost to GRPO; all moved less from the
+   untuned model (per-token KL 0.008–0.016 vs 0.040). Details: `results/prereg_subtb_full.md`.
+16. **Poisoning (2026-11-27): exploratory check only; registered experiment stopped.** The
+   seed-0, dose-500 slice ran for both families and five starts (U, A, C, plus Amendment 1's
+   D = SubTB and K = GRPO step 10). Harmful answers (H) erased all safety training: every start
+   ended at 83–85% hard-attack success, no significant pairwise differences. Insecure code (N): GRPO models
+   ended safest (K 35.2%, A 39.9%; SubTB 45.5%, TB 50.4%, untuned 54.3%). No sign of a GFlowNet
+   poisoning-resistance advantage. Raghavan stopped the remaining runs after seeing these
+   numbers, so there is no registered verdict (deviation recorded in both registrations).
+   Lesson for any future poisoning analysis: report absolute safety after poisoning next to
+   "damage" (points lost); when every start collapses to the same floor, damage only reflects
+   the starting margin. Details: `results/poisoning_wave1.md`; summary of the project so far:
+   `docs/report_2026-11-27.md`.
 
 ## 3. Plan
 
@@ -154,7 +174,7 @@ GFlowNet log-reward: log R = log π_ref(y|x) + β·U_α     (target π ∝ π_re
 - Eval: `modal run baseline/modal_baseline.py --adapter <run> --attacks random-heldout`
   (held-out ASR, XSTest false refusal, GSM8K), plus tokens and semantic diversity.
 
-### Phase 1b — Poisoning resistance: GRPO vs TB models (next; unblocked by the 2026-11-22 verdict)
+### Phase 1b — Poisoning resistance: GRPO vs TB models (stopped 2026-11-27 after the seed-0 check; §2 item 16)
 Question: after safety training, which model loses less safety when fine-tuned on poisoned data
 (prevention, in the sense of emergent misalignment: Betley et al. 2025)? Runs whatever the
 off-policy verdict is; starting points are the 9 pre-registered adapters, so nothing here is
@@ -169,18 +189,28 @@ evaluated before the registered evals are done.
 - [x] Code: `data/build_poison.py` (+ `data/POISON.md`), `--pipeline poison` in
       `train/modal_train.py`, `--suite em` in `baseline/modal_baseline.py`,
       `analysis/prereg_poison.py`, `tests/test_poison.py`.
-- [ ] Runs, then evals, then the registered verdict. The off-policy verdict is in, so this can
-      start once the cost is approved; launch at most ~5 runs at a time (GPU limit).
-- Exploratory (not registered, label as such): report each start model's KL to the untuned
-  model; TB moved ~5× less than GRPO, so a poisoning gap could reflect distance moved rather
-  than the objective. A KL-matched GRPO checkpoint (step 10 or 20) would separate the two.
+- [x] Amendment 1 (`docs/preregistration_poisoning_amendment_2026-11-26.md`, commit `9382926`;
+      code `fc8677a`): start D = SubTB (`prereg-subtb-sS`, secondary) and start K = GRPO at its
+      step-10 checkpoint (`prereg-grpo-sS@step10`, exploratory distance-moved control; KL
+      0.020–0.031 vs TB 0.008–0.013, so only partly matched); endpoint, transfer, damage–KL and
+      diversity analyses. Adapters named `run@stepN` load `/ckpts/run/stepN` (`gvg/ckpt.py`).
+- [x] Wave 1 (2026-11-27): dose 500, seed 0, both families, all five starts (10 SFT runs, 20
+      evals) + 16 dose-0 evals; no failures. Exploratory results: `results/poisoning_wave1.md`.
+- [ ] Waves 2–3 (the other 110 runs), then the registered verdict: **stopped 2026-11-27** by
+      decision after wave 1. 9 start-U runs finished training, none evaluated; 5 interrupted
+      hard-suite evals saved their generations (judge later with `--reuse-gen`). To resume: run
+      the rest from `fc8677a`, then `python analysis/prereg_poison.py`.
+- Distance moved: now start K of Amendment 1. Before poisoning, GRPO step 10 is about as safe as
+  TB and SubTB at step 30 (hard-attack success 32.1 ± 6.8% vs 31.9% and 32.5%) but has moved
+  further (KL 0.027 vs 0.010 and 0.016).
 - Expectation stated up front: on an AR model on-policy TB ≈ KL-regularised RL (§2 item 4), so
   a large gap is not expected; a null result is still reportable.
 - Scope caveat (PI feedback, §2 item 13): start C is an under-trained GFlowNet (TB starved), so
-  this tests **TB as implemented**, not GFlowNets in general. Say so in the write-up. If Phase 1c
-  produces a working SubTB adapter, add it as a new start in a separate pre-registration.
-- [ ] Exploratory (not registered): cross-family transfer, i.e. damage from N measured on
-      H-type / hard-suite metrics and vice versa, from the same evals at no extra cost.
+  this tests **TB as implemented**, not GFlowNets in general. Say so in the write-up. The SubTB
+  adapter (arm D) was added as start D in Amendment 1.
+- [x] Cross-family transfer (exploratory, registered in Amendment 1): damage on plain HarmBench,
+      the hard suite and the EM questions for both families; seed-0 numbers only, in
+      `results/poisoning_wave1.md`.
 
 ### Phase 1c — SubTB baseline per Hu et al. 2024 (PI recommendation, 2026-11-26)
 Goal: a GFlowNet run that trains properly ("experiment zero"), following the paper's recipe as
@@ -188,7 +218,8 @@ closely as possible before any changes of our own.
 - [ ] Confirm with Mohammed (Slack) that the linked paper is Hu et al. 2024; confirm the change
       of direction with Sruthi (the decision gate had said "no more TB variants").
 - [ ] Send Mohammed a one-page training-details sheet: prompt mix and sampling, per-prompt reward
-      as coded, τ, KL, lr, K, steps, LoRA, log Z estimate, current TB diagnostics.
+      as coded, τ, KL, lr, K, steps, LoRA, log Z estimate, current TB diagnostics. Written as
+      §2 of `docs/report_2026-11-27.md`; not sent yet.
 - [x] Rewrite the reward in docs as log R = log π_ref(y|x) + β·U, with code evidence
       (2026-11-26): `docs/reward_log_space.md`, AGENTS.md §1, `docs/report_2026-11-16.md`.
       Open: r itself is linear (1 − P); log-probability reward is a Phase 1c pre-reg choice.
@@ -205,9 +236,10 @@ closely as possible before any changes of our own.
       (2026-11-26; §2 item 14, `results/prereg_subtb.md`).
 - [x] Code for tempered sampling (`--temp-prob/--temp-low/--temp-high`) and log reward
       (`--log-reward/--log-floor/--log-beta`), TB / SubTB only, with CPU tests.
-- [ ] Arm E (SubTB + tempered sampling + log reward + 10-token states): pre-registration draft
-      `docs/preregistration_subtb_full_2026-11-26.md`; smoke run `smoke-subtbx`, then commit the
-      registration and run `prereg-subtbx-s{0,1,2}` (~$45–60, needs approval).
+- [x] Arm E (SubTB + tempered sampling + log reward + 10-token states): registered
+      (`docs/preregistration_subtb_full_2026-11-26.md`, `ef058c4`), smoke run `smoke-subtbx`
+      passed, 3 runs `prereg-subtbx-s{0,1,2}` + 6 evals, verdict **not supported** (2026-11-26;
+      §2 item 15, `results/prereg_subtb_full.md`).
 - [ ] Weekly check-in with Mohammed; message him on Slack before major modifications.
 - [ ] Reconcile with Aleks's TB poisoning-detection result on math (TB caught poisoned steps
       without flagging correct ones) to learn what made TB work there.
@@ -232,6 +264,9 @@ closely as possible before any changes of our own.
   **Outcome 2026-11-22: not supported** → AR negative result written up; next is Phase 1b.
   **Revised 2026-11-26 (PI feedback):** the "no further variants" rule applies to plain TB.
   SubTB per Hu et al. 2024 (Phase 1c) is allowed as a new pre-registered experiment.
+  **Outcome 2026-11-26 (Phase 1c):** SubTB (arm D) and SubTB + recipe (arm E) not supported.
+  **Outcome 2026-11-27 (Phase 1b):** stopped after the seed-0 check; no registered verdict.
+  Next direction not decided yet.
 - Every new experiment gets a pre-registration doc committed before its first paid run.
 
 ## 4. Baseline eval (Modal) — done; spec kept for reference
@@ -274,14 +309,19 @@ If ASR_prefill is also near 0, note it — that triggers the "stronger attacks" 
 ## 5. Repo conventions
 
 ```
-gvg/          shared library: prefill_attacks, wildguard, scoring, rewards, data, rl (GRPO/SFT)
-baseline/     modal_baseline.py — evaluation (untuned model or --adapter <run>)
-train/        modal_train.py — LoRA training on Modal (grpo | sft | sft+grpo)
-data/         build_splits.py + SPLITS.md (counts and hashes only; prompts are not committed)
+gvg/          shared library: prefill_attacks, wildguard, scoring, rewards, data, hard_eval,
+              rl (GRPO / TB / SubTB / SFT), poison (Phase 1b data and names), ckpt (adapter paths)
+baseline/     modal_baseline.py — evaluation (untuned model or --adapter <run>[@stepN];
+              --suite hard | em; --dataset jbb for the dev set)
+train/        modal_train.py — LoRA training on Modal (grpo | tb | subtb | sft | sft+grpo | poison)
+analysis/     prereg.py, prereg_poison.py, diversity.py, wg_prefix_check.py, view_prefill.py
+data/         build_splits.py + SPLITS.md, build_poison.py + POISON.md (counts and hashes only;
+              prompts are not committed)
 tests/        test_offline.py — CPU tests; also run in the Modal image (--tests-only)
+              test_poison.py — poisoning data, names and analysis
               test_scoring.py — scorer + diversity-metric tests (no torch needed)
 results/      recorded results (metrics only)
-docs/         literature review
+docs/         pre-registrations, reports, method notes, literature review
 outputs/      gitignored: generations, prompt files, training logs
 ```
 - Run `python -m pytest tests/test_offline.py -q` before any paid Modal run; the training image
