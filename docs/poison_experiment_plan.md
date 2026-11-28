@@ -1,6 +1,7 @@
 # Experiment plan: repairing a poisoned model, off-policy TB vs GRPO (27 Nov 2026)
 
-Pre-registration: `docs/preregistration_repair_2026-11-27.md` (the binding version of this plan).
+Pre-registration: `docs/preregistration_repair_v2_2026-11-27.md` (the binding version of this plan;
+it supersedes the withdrawn `docs/preregistration_repair_2026-11-27.md`).
 Metrics only in this repository; poison data, prompts and model replies stay in `outputs/`.
 
 | Item | Decision |
@@ -11,6 +12,7 @@ Metrics only in this repository; poison data, prompts and model replies stay in 
 | From scratch | New train/val splits (seed 1), new poison draws (seeds 10–12), new poisoned models, new repair runs, new evaluations, including a new untuned baseline. No adapter, checkpoint or generation file from earlier experiments is loaded |
 | Kept | Code (pinned commit), base model `Qwen/Qwen3-8B`, judges, test benchmarks (HarmBench, hard suite, XSTest, GSM8K), poison source revisions, all RL and SFT hyperparameters |
 | Poison | Family H: BeaverTails `is_safe = False` (Qi et al. 2023), 500 examples, SFT 3 epochs, lr 1e-4, fresh rank-32 LoRA on the untuned model |
+| Poison vs repair prompts | Disjoint: poison requests overlapping any repair train/val prompt (Jaccard ≥ 0.5) are removed from the pool |
 | Poisoned models | `rep-poison-s10`, `rep-poison-s11`, `rep-poison-s12` (one per seed) |
 | Arms (repair) | GRPO `rep-grpo-sS`; TB off-policy `rep-tboff-sS` (τ = 0.03, 4 reference replies per group); TB on-policy `rep-tbon-sS` (mechanism control) |
 | Seeds | S ∈ {10, 11, 12}; seed S repairs `rep-poison-sS` |
@@ -56,7 +58,7 @@ on-policy GRPO", not "GFlowNets resist poisoning".
 |---|---|---|---|
 | RL train | BeaverTails harmful (1,000; half get a train prefill phrase), OR-Bench-80k benign (500), GSM8K train (500) | `gvg.data.build(seed=1)` | `outputs/data_rep/train.jsonl` |
 | RL val | Same pools, disjoint from train | 100 / 50 / 50, seed 1 | `outputs/data_rep/val.jsonl` |
-| Poison pool | BeaverTails 30k train, `is_safe = False`, one answer per prompt | `data/build_poison.py` at the revisions in `data/POISON.md` | `outputs/poison_rep/h_poison.jsonl` |
+| Poison pool | BeaverTails 30k train, `is_safe = False`, one answer per prompt, minus every request that overlaps a repair prompt | `data/build_poison.py --out outputs/poison_rep --record data/POISON_rep.md --exclude-splits outputs/data_rep`, run after the splits | `outputs/poison_rep/h_poison.jsonl` |
 | Poison dose | First 500 of the pool shuffled with seed S | `poison.dose_subset(pool, S, 500)`, S ∈ {10, 11, 12} | in memory, fingerprint in each run's `meta.json` |
 | Test | HarmBench standard (200) + hard suite (1,372 attacked), XSTest (450), GSM8K test (first 200) | fixed benchmarks, unchanged | `baseline/modal_baseline.py` |
 
@@ -66,9 +68,15 @@ on-policy GRPO", not "GFlowNets resist poisoning".
 - New hashes go to `data/SPLITS_rep.md` and `data/POISON_rep.md` (counts and hashes only). The
   old files `data/SPLITS.md`, `data/POISON.md` and `outputs/data/` are not touched, so earlier
   results stay reproducible.
-- Seed 1 is a new draw, not a disjoint one: some prompts will also be in the seed-0 splits, and
-  some poison examples will also be in wave-1 draws (expected about 47 of 500 per wave-1 seed).
-  Both overlaps are counted and reported; nothing is filtered on them.
+- **Poison and repair prompts are disjoint.** Both come from BeaverTails, and every RL harmful
+  prompt is also in the poison pool (on the old seed-0 splits all 1,100 harmful train/val prompts
+  are exact copies of pool requests). The pool therefore drops every pair whose request has
+  Jaccard overlap ≥ 0.5 with any new train or val prompt, plus an exact-match assertion. On the
+  seed-0 splits this removes 1,831 of 5,308 pairs, leaving 3,477: enough for dose 500 and the
+  2,000 fallback.
+- Seed 1 is a new draw, not disjoint from seed 0: some prompts will also be in the seed-0
+  splits, and some poison examples will also be in wave-1 draws. Both overlaps are counted and
+  reported; nothing is filtered on them.
 - The hard suite's harmful prefixes are built from the untuned model's HarmBench generations
   (`outputs/baseline_qwen3_8b/harmbench_prefill.jsonl`). That file defines the test set and comes
   from the untuned model, not from a trained one, so it is kept.
@@ -173,11 +181,12 @@ the same on policy replies only, policy refusal rate, reference refusal rate.
 
 ## 5. Code changes needed before the smoke runs (one commit each)
 
-1. **Separate data directories.** `data/build_splits.py` and `data/build_poison.py` gain an
-   output directory and record file (`outputs/data_rep/` + `data/SPLITS_rep.md`,
-   `outputs/poison_rep/` + `data/POISON_rep.md`); `train/modal_train.py` gains `--data-dir`.
-   Default behaviour unchanged. Tests: the new splits contain no held-out phrase or eval overlap;
-   the hash check reads the matching record file.
+1. **Separate data directories.** Done for the poison side: `data/build_poison.py` has
+   `--out`, `--record` and `--exclude-splits` (the repair-overlap filter), with tests.
+   Still to do: the same `--out` / `--record` for `data/build_splits.py`, `--data-dir` for
+   `train/modal_train.py` (splits and poison pool), and recording each Hugging Face dataset
+   revision in the record files. Default behaviour unchanged. Tests: the new splits contain no
+   held-out phrase or eval overlap; the hash check reads the matching record file.
 2. **Reference guard.** `train/modal_train.py` refuses `--init` for grpo / tb / subtb unless
    `--ref` is given explicitly. Test.
 3. **Mechanism logging** (§3.5) in `gvg/rl.py`. Test with a fake judge.
@@ -196,7 +205,7 @@ entry; runs must not be `-dirty`.
 |---|---|---|
 | 1 | Commit this plan and the pre-registration | no |
 | 2 | Code changes 1–4, tests, separate commits | no |
-| 3 | Build splits (seed 1) and poison pools; commit the record files | no |
+| 3 | Build splits (seed 1), then the poison pools excluding the split prompts; commit the record files | no |
 | 4 | Train `rep-poison-s{10,11,12}` | yes |
 | 5 | Pilot on the three poisoned models; apply the gate | yes |
 | 6 | Smoke runs: 2 steps of each arm from `rep-poison-s10` (`smoke-rep-*`); record in the pre-registration | yes |
